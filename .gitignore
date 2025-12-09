@@ -3,3 +3,6 @@ node_modules
 .env
 
 /src/generated/prisma
+prisma
+uploads
+docker-compose.yml
