@@ -7,75 +7,6 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
-// Models SEM userId obrigatório
-model Topic {
-  id                String    @id @default(cuid())
-  name              String
-  internalNorm      String?
-  description       String?
-  order             Int       @default(0)
-  isActive          Boolean   @default(true)
-  userId            String?   // ⚠️ OPCIONAL agora
-  createdAt         DateTime  @default(now())
-  updatedAt         DateTime  @updatedAt
-  
-  // Relação opcional
-  user              User?     @relation(fields: [userId], references: [id], onDelete: Cascade)
-  questions         Question[]
-  
-  @@map("topics")
-}
-
-model Question {
-  id                String    @id @default(cuid())
-  title             String
-  description       String?
-  isApplicable      Boolean   @default(true)
-  criticality       String    @default("MEDIA")
-  order             Int       @default(0)
-  topicId           String
-  createdAt         DateTime  @default(now())
-  updatedAt         DateTime  @updatedAt
-  
-  topic             Topic     @relation(fields: [topicId], references: [id], onDelete: Cascade)
-  answer            Answer?
-  
-  @@map("questions")
-}
-
-model Answer {
-  id                String    @id @default(cuid())
-  response          Boolean
-  justification     String?
-  deficiency        String?
-  recommendation    String?
-  questionId        String    @unique
-  userId            String?
-  createdAt         DateTime  @default(now())
-  updatedAt         DateTime  @updatedAt
-  
-  question          Question  @relation(fields: [questionId], references: [id], onDelete: Cascade)
-  user              User?     @relation(fields: [userId], references: [id], onDelete: Cascade)
-  evidences         Evidence[]
-  
-  @@map("answers")
-}
-
-model Evidence {
-  id                String    @id @default(cuid())
-  filename          String
-  originalName      String
-  path              String
-  mimeType          String
-  size              Int
-  answerId          String
-  uploadedAt        DateTime  @default(now())
-  
-  answer            Answer    @relation(fields: [answerId], references: [id], onDelete: Cascade)
-  
-  @@map("evidences")
-}
-
 model User {
   id                String    @id @default(cuid())
   email             String    @unique
@@ -90,6 +21,89 @@ model User {
   
   topics            Topic[]
   answers           Answer[]
+  reports           Report[]
   
   @@map("users")
+}
+
+model Topic {
+  id                String    @id @default(cuid())
+  name              String
+  internalNorm      String?
+  description       String?
+  order             Int       @default(0)
+  isActive          Boolean   @default(true)
+  userId            String
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+  
+  user              User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  questions         Question[]
+  
+  @@map("topics")
+}
+
+model Question {
+  id                String     @id @default(cuid())
+  title             String
+  description       String?
+  isApplicable      Boolean    @default(true)
+  criticality       String     @default("MEDIA")
+  order             Int        @default(0)
+  topicId           String
+  createdAt         DateTime   @default(now())
+  updatedAt         DateTime   @updatedAt
+  
+  topic             Topic      @relation(fields: [topicId], references: [id], onDelete: Cascade)
+  answer            Answer?
+  
+  @@map("questions")
+}
+
+model Answer {
+  id                String     @id @default(cuid())
+  response          Boolean
+  justification     String?
+  deficiency        String?
+  recommendation    String?
+  questionId        String     @unique
+  userId            String
+  createdAt         DateTime   @default(now())
+  updatedAt         DateTime   @updatedAt
+  
+  question          Question   @relation(fields: [questionId], references: [id], onDelete: Cascade)
+  user              User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  evidences         Evidence[]
+  
+  @@map("answers")
+}
+
+model Evidence {
+  id                String     @id @default(cuid())
+  filename          String
+  originalName      String
+  path              String
+  mimeType          String
+  size              Int
+  answerId          String
+  uploadedAt        DateTime   @default(now())
+  
+  answer            Answer     @relation(fields: [answerId], references: [id], onDelete: Cascade)
+  
+  @@map("evidences")
+}
+
+model Report {
+  id                String     @id @default(cuid())
+  name              String
+  type              String     @default("FULL")
+  format            String     @default("PDF")
+  content           String?
+  filePath          String?
+  userId            String
+  createdAt         DateTime   @default(now())
+  
+  user              User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  
+  @@map("reports")
 }
