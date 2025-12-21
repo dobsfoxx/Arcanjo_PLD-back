@@ -144,7 +144,9 @@ export class ReportService {
     const reportsDir = getReportsDir();
 
     const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
-    const baseUrl = process.env.PUBLIC_BASE_URL || "http://localhost:3001";
+    const baseUrl = (process.env.PUBLIC_BASE_URL || "http://localhost:3001")
+      .replace(/\/api\/?$/, "")
+      .replace(/\/+$/, "");
     const generatedAt = new Date().toLocaleString("pt-BR");
 
     const title = "Relatório PLD";
@@ -974,7 +976,9 @@ export class ReportService {
     }
 
     const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
-    const baseUrl = process.env.PUBLIC_BASE_URL || "http://localhost:3001";
+    const baseUrl = (process.env.PUBLIC_BASE_URL || "http://localhost:3001")
+      .replace(/\/api\/?$/, "")
+      .replace(/\/+$/, "");
 
     if (format === "DOCX") {
       const filename = `pld-report-${userId}-${timestamp}.docx`;

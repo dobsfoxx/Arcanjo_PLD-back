@@ -112,7 +112,9 @@ class ReportService {
         });
         const reportsDir = (0, paths_1.getReportsDir)();
         const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
-        const baseUrl = process.env.PUBLIC_BASE_URL || "http://localhost:3001";
+        const baseUrl = (process.env.PUBLIC_BASE_URL || "http://localhost:3001")
+            .replace(/\/api\/?$/, "")
+            .replace(/\/+$/, "");
         const generatedAt = new Date().toLocaleString("pt-BR");
         const title = "Relatório PLD";
         const reportName = `Relatório PLD Builder - ${user.name}`;
@@ -703,7 +705,9 @@ class ReportService {
             fs_1.default.mkdirSync(reportsDir, { recursive: true });
         }
         const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
-        const baseUrl = process.env.PUBLIC_BASE_URL || "http://localhost:3001";
+        const baseUrl = (process.env.PUBLIC_BASE_URL || "http://localhost:3001")
+            .replace(/\/api\/?$/, "")
+            .replace(/\/+$/, "");
         if (format === "DOCX") {
             const filename = `pld-report-${userId}-${timestamp}.docx`;
             const filePath = path_1.default.join(reportsDir, filename);
