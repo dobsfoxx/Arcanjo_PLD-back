@@ -1,6 +1,7 @@
 import prisma from '../config/database'
 import path from 'path'
 import { getUploadsRoot } from '../config/paths'
+import { getStorageProvider, uploadFileToStorage } from '../config/storage'
 
 export const ATTACHMENT_CATEGORIES = {
   NORMA: 'NORMA',
@@ -151,6 +152,16 @@ export class PldBuilderService {
       .relative(getUploadsRoot(), file.path)
       .replace(/\\/g, '/')
       .replace(/^\/+/, '')
+
+    if (getStorageProvider() === 'supabase') {
+      const objectKey = relativePath || file.filename
+      await uploadFileToStorage({
+        localPath: file.path,
+        objectKey,
+        contentType: file.mimetype,
+        deleteLocal: true,
+      })
+    }
 
     const publicPath = relativePath ? `uploads/${relativePath}` : `uploads/${file.filename}`
 

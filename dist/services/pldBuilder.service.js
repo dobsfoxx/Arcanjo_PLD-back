@@ -7,6 +7,7 @@ exports.PldBuilderService = exports.ATTACHMENT_CATEGORIES = void 0;
 const database_1 = __importDefault(require("../config/database"));
 const path_1 = __importDefault(require("path"));
 const paths_1 = require("../config/paths");
+const storage_1 = require("../config/storage");
 exports.ATTACHMENT_CATEGORIES = {
     NORMA: 'NORMA',
     TEMPLATE: 'TEMPLATE',
@@ -117,6 +118,15 @@ class PldBuilderService {
             .relative((0, paths_1.getUploadsRoot)(), file.path)
             .replace(/\\/g, '/')
             .replace(/^\/+/, '');
+        if ((0, storage_1.getStorageProvider)() === 'supabase') {
+            const objectKey = relativePath || file.filename;
+            await (0, storage_1.uploadFileToStorage)({
+                localPath: file.path,
+                objectKey,
+                contentType: file.mimetype,
+                deleteLocal: true,
+            });
+        }
         const publicPath = relativePath ? `uploads/${relativePath}` : `uploads/${file.filename}`;
         // Para o builder, cada categoria representa um único arquivo (por seção/pergunta).
         // Evita duplicação ao salvar o builder várias vezes.
