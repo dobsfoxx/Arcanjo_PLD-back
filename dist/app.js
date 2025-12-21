@@ -9,6 +9,7 @@ const helmet_1 = __importDefault(require("helmet"));
 const morgan_1 = __importDefault(require("morgan"));
 const dotenv_1 = require("dotenv");
 const paths_1 = require("./config/paths");
+const storage_1 = require("./config/storage");
 (0, dotenv_1.config)();
 const app = (0, express_1.default)();
 // Segurança básica
@@ -53,6 +54,25 @@ app.use('/api/form', form_routes_1.default);
 app.use('/api/report', report_routes_1.default);
 app.use('/api/pld', pldBuilder_routes_1.default);
 // Arquivos estáticos (uploads, evidências, relatórios)
+if ((0, storage_1.getStorageProvider)() === 'supabase') {
+    app.get('/uploads/*', async (req, res) => {
+        try {
+            const wildcard = req.params[0];
+            const objectKey = (wildcard || '').replace(/^\/+/, '');
+            if (!objectKey || objectKey.split('/').some((seg) => seg === '..')) {
+                return res.status(400).json({ error: 'Caminho inválido' });
+            }
+            const signedUrl = await (0, storage_1.createSignedUrlForStoredPath)(`uploads/${objectKey}`);
+            if (!signedUrl) {
+                return res.status(404).json({ error: 'Arquivo não encontrado' });
+            }
+            return res.redirect(signedUrl);
+        }
+        catch (error) {
+            return res.status(400).json({ error: error.message || 'Erro ao acessar arquivo' });
+        }
+    });
+}
 app.use('/uploads', express_1.default.static((0, paths_1.getUploadsRoot)(), {
     index: false,
     dotfiles: 'deny',

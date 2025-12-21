@@ -8,6 +8,7 @@ const fs_1 = __importDefault(require("fs"));
 const auth_1 = require("../middleware/auth");
 const reportServices_1 = require("../services/reportServices");
 const paths_1 = require("../config/paths");
+const storage_1 = require("../config/storage");
 const router = express_1.default.Router();
 // Gera e retorna o relatório do usuário autenticado
 router.get('/me', auth_1.authenticate, async (req, res) => {
@@ -103,6 +104,13 @@ router.get('/:id/download', auth_1.authenticate, async (req, res) => {
         }
         if (!report.filePath) {
             return res.status(404).json({ error: 'Arquivo de relatório não disponível' });
+        }
+        if ((0, storage_1.getStorageProvider)() === 'supabase') {
+            const signedUrl = await (0, storage_1.createSignedUrlForStoredPath)(report.filePath);
+            if (!signedUrl) {
+                return res.status(404).json({ error: 'Arquivo de relatório não encontrado' });
+            }
+            return res.redirect(signedUrl);
         }
         const absolutePath = (0, paths_1.resolveFromUploads)(report.filePath);
         if (!fs_1.default.existsSync(absolutePath)) {

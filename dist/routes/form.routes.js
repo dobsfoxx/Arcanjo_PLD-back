@@ -11,6 +11,7 @@ const fs_1 = __importDefault(require("fs"));
 const database_1 = __importDefault(require("../config/database"));
 const auth_1 = require("../middleware/auth");
 const paths_1 = require("../config/paths");
+const storage_1 = require("../config/storage");
 const router = express_1.default.Router();
 // =========== TÓPICOS ===========
 router.post('/topics', auth_1.authenticate, auth_1.requireAdmin, async (req, res) => {
@@ -60,6 +61,14 @@ router.post('/topics/:id/norm', auth_1.authenticate, upload_1.upload.single('fil
                 .relative((0, paths_1.getUploadsRoot)(), req.file.path)
                 .replace(/\\/g, '/')
                 .replace(/^\/+/, '');
+            if ((0, storage_1.getStorageProvider)() === 'supabase') {
+                await (0, storage_1.uploadFileToStorage)({
+                    localPath: req.file.path,
+                    objectKey: relativePath,
+                    contentType: req.file.mimetype,
+                    deleteLocal: true,
+                });
+            }
             data.normFilename = req.file.filename;
             data.normOriginalName = req.file.originalname;
             data.normPath = relativePath;
@@ -203,6 +212,14 @@ router.post('/questions/:id/template', auth_1.authenticate, auth_1.requireAdmin,
             .relative((0, paths_1.getUploadsRoot)(), req.file.path)
             .replace(/\\/g, '/')
             .replace(/^\/+/, '');
+        if ((0, storage_1.getStorageProvider)() === 'supabase') {
+            await (0, storage_1.uploadFileToStorage)({
+                localPath: req.file.path,
+                objectKey: relativePath,
+                contentType: req.file.mimetype,
+                deleteLocal: true,
+            });
+        }
         const updated = await database_1.default.question.update({
             where: { id },
             data: {
@@ -229,6 +246,14 @@ router.get('/questions/:id/template/download', auth_1.authenticate, async (req, 
         }
         if (!question.templatePath) {
             return res.status(404).json({ error: 'Nenhum arquivo-modelo anexado' });
+        }
+        if ((0, storage_1.getStorageProvider)() === 'supabase') {
+            const storedPath = `uploads/${(0, paths_1.stripUploadsPrefix)(question.templatePath)}`;
+            const signedUrl = await (0, storage_1.createSignedUrlForStoredPath)(storedPath);
+            if (!signedUrl) {
+                return res.status(404).json({ error: 'Arquivo-modelo não encontrado' });
+            }
+            return res.redirect(signedUrl);
         }
         // NOTE: templatePath é salvo como caminho relativo (sem garantir prefixo 'uploads/')
         // e em produção UPLOAD_PATH pode estar fora do projeto.
@@ -326,6 +351,14 @@ router.post('/answers/:answerId/evidences', auth_1.authenticate, upload_1.upload
                 .replace(/\\/g, '/')
                 .replace(/^\/+/, '');
             const publicPath = relative ? `uploads/${relative}` : `uploads/${file.filename}`;
+            if ((0, storage_1.getStorageProvider)() === 'supabase') {
+                await (0, storage_1.uploadFileToStorage)({
+                    localPath: file.path,
+                    objectKey: relative,
+                    contentType: file.mimetype,
+                    deleteLocal: true,
+                });
+            }
             return await database_1.default.evidence.create({
                 data: {
                     filename: file.filename,

@@ -3,6 +3,7 @@ import fs from 'fs'
 import { authenticate } from '../middleware/auth'
 import { ReportService } from '../services/reportServices'
 import { resolveFromUploads } from '../config/paths'
+import { createSignedUrlForStoredPath, getStorageProvider } from '../config/storage'
 
 const router = express.Router()
 
@@ -116,6 +117,14 @@ router.get('/:id/download', authenticate, async (req, res) => {
 
     if (!report.filePath) {
       return res.status(404).json({ error: 'Arquivo de relatório não disponível' })
+    }
+
+    if (getStorageProvider() === 'supabase') {
+      const signedUrl = await createSignedUrlForStoredPath(report.filePath)
+      if (!signedUrl) {
+        return res.status(404).json({ error: 'Arquivo de relatório não encontrado' })
+      }
+      return res.redirect(signedUrl)
     }
 
     const absolutePath = resolveFromUploads(report.filePath)

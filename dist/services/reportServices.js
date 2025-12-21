@@ -11,6 +11,7 @@ const docx_1 = require("docx");
 const database_1 = __importDefault(require("../config/database"));
 const form_services_1 = require("./form.services");
 const paths_1 = require("../config/paths");
+const storage_1 = require("../config/storage");
 class ReportService {
     static buildDocxCard(children) {
         // Approx A4 page content width with default 1" margins: ~6.5" => 9360 twips.
@@ -273,6 +274,14 @@ class ReportService {
             });
             const buffer = await docx_1.Packer.toBuffer(doc);
             fs_1.default.writeFileSync(filePath, buffer);
+            if ((0, storage_1.getStorageProvider)() === "supabase") {
+                await (0, storage_1.uploadFileToStorage)({
+                    localPath: filePath,
+                    objectKey: `reports/${filename}`,
+                    contentType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    deleteLocal: true,
+                });
+            }
             const report = await database_1.default.report.create({
                 data: {
                     name: reportName,
@@ -633,6 +642,14 @@ class ReportService {
             stream.on("finish", () => resolve());
             stream.on("error", (err) => reject(err));
         });
+        if ((0, storage_1.getStorageProvider)() === "supabase") {
+            await (0, storage_1.uploadFileToStorage)({
+                localPath: filePath,
+                objectKey: `reports/${filename}`,
+                contentType: "application/pdf",
+                deleteLocal: true,
+            });
+        }
         const report = await database_1.default.report.create({
             data: {
                 name: reportName,
@@ -841,6 +858,14 @@ class ReportService {
             });
             const buffer = await docx_1.Packer.toBuffer(doc);
             fs_1.default.writeFileSync(filePath, buffer);
+            if ((0, storage_1.getStorageProvider)() === "supabase") {
+                await (0, storage_1.uploadFileToStorage)({
+                    localPath: filePath,
+                    objectKey: `reports/${filename}`,
+                    contentType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    deleteLocal: true,
+                });
+            }
             const report = await database_1.default.report.create({
                 data: {
                     name: `Relatório PLD - ${user.name}`,
@@ -1177,6 +1202,14 @@ class ReportService {
             stream.on("finish", () => resolve());
             stream.on("error", (err) => reject(err));
         });
+        if ((0, storage_1.getStorageProvider)() === "supabase") {
+            await (0, storage_1.uploadFileToStorage)({
+                localPath: filePath,
+                objectKey: `reports/${filename}`,
+                contentType: "application/pdf",
+                deleteLocal: true,
+            });
+        }
         const report = await database_1.default.report.create({
             data: {
                 name: `Relatório PLD - ${user.name}`,

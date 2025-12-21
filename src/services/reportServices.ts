@@ -21,6 +21,7 @@ import {
 import prisma from "../config/database";
 import { FormService } from "./form.services";
 import { getReportsDir } from "../config/paths";
+import { getStorageProvider, uploadFileToStorage } from "../config/storage";
 
 export class ReportService {
   private static buildDocxCard(children: Paragraph[]) {
@@ -420,6 +421,16 @@ export class ReportService {
 
       const buffer = await Packer.toBuffer(doc);
       fs.writeFileSync(filePath, buffer);
+
+      if (getStorageProvider() === "supabase") {
+        await uploadFileToStorage({
+          localPath: filePath,
+          objectKey: `reports/${filename}`,
+          contentType:
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+          deleteLocal: true,
+        });
+      }
 
       const report = await (prisma as any).report.create({
         data: {
@@ -885,6 +896,15 @@ export class ReportService {
       stream.on("error", (err) => reject(err));
     });
 
+    if (getStorageProvider() === "supabase") {
+      await uploadFileToStorage({
+        localPath: filePath,
+        objectKey: `reports/${filename}`,
+        contentType: "application/pdf",
+        deleteLocal: true,
+      });
+    }
+
     const report = await (prisma as any).report.create({
       data: {
         name: reportName,
@@ -1184,6 +1204,16 @@ export class ReportService {
 
       const buffer = await Packer.toBuffer(doc);
       fs.writeFileSync(filePath, buffer);
+
+      if (getStorageProvider() === "supabase") {
+        await uploadFileToStorage({
+          localPath: filePath,
+          objectKey: `reports/${filename}`,
+          contentType:
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+          deleteLocal: true,
+        });
+      }
 
       const report = await (prisma as any).report.create({
         data: {
@@ -1582,6 +1612,15 @@ export class ReportService {
       stream.on("finish", () => resolve());
       stream.on("error", (err) => reject(err));
     });
+
+    if (getStorageProvider() === "supabase") {
+      await uploadFileToStorage({
+        localPath: filePath,
+        objectKey: `reports/${filename}`,
+        contentType: "application/pdf",
+        deleteLocal: true,
+      });
+    }
 
     const report = await (prisma as any).report.create({
       data: {

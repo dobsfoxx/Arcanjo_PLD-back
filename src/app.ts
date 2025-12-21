@@ -5,6 +5,7 @@ import morgan from 'morgan'
 import { config } from 'dotenv'
 import path from 'path'
 import { getUploadsRoot } from './config/paths'
+import { createSignedUrlForStoredPath, getStorageProvider } from './config/storage'
 
 config()
 
@@ -64,6 +65,27 @@ app.use('/api/report', reportRoutes)
 app.use('/api/pld', pldBuilderRoutes)
 
 // Arquivos estáticos (uploads, evidências, relatórios)
+if (getStorageProvider() === 'supabase') {
+  app.get('/uploads/*', async (req, res) => {
+    try {
+      const wildcard = (req.params as any)[0] as string | undefined
+      const objectKey = (wildcard || '').replace(/^\/+/, '')
+      if (!objectKey || objectKey.split('/').some((seg) => seg === '..')) {
+        return res.status(400).json({ error: 'Caminho inválido' })
+      }
+
+      const signedUrl = await createSignedUrlForStoredPath(`uploads/${objectKey}`)
+      if (!signedUrl) {
+        return res.status(404).json({ error: 'Arquivo não encontrado' })
+      }
+
+      return res.redirect(signedUrl)
+    } catch (error: any) {
+      return res.status(400).json({ error: error.message || 'Erro ao acessar arquivo' })
+    }
+  })
+}
+
 app.use(
   '/uploads',
   express.static(getUploadsRoot(), {

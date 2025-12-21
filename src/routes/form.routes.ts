@@ -5,7 +5,8 @@ import { upload, uploadMultiple } from '../config/upload'
 import fs from 'fs'
 import prisma from '../config/database'
 import { authenticate, requireAdmin } from '../middleware/auth'
-import { getUploadsRoot, resolveFromUploads } from '../config/paths'
+import { getUploadsRoot, resolveFromUploads, stripUploadsPrefix } from '../config/paths'
+import { getStorageProvider, uploadFileToStorage, createSignedUrlForStoredPath } from '../config/storage'
 
 const router = express.Router()
 
@@ -63,6 +64,16 @@ router.post('/topics/:id/norm', authenticate, upload.single('file'), async (req,
         .relative(getUploadsRoot(), req.file.path)
         .replace(/\\/g, '/')
         .replace(/^\/+/, '')
+
+      if (getStorageProvider() === 'supabase') {
+        await uploadFileToStorage({
+          localPath: req.file.path,
+          objectKey: relativePath,
+          contentType: req.file.mimetype,
+          deleteLocal: true,
+        })
+      }
+
       data.normFilename = req.file.filename
       data.normOriginalName = req.file.originalname
       data.normPath = relativePath
@@ -217,6 +228,15 @@ router.post('/questions/:id/template', authenticate, requireAdmin, upload.single
       .replace(/\\/g, '/')
       .replace(/^\/+/, '')
 
+    if (getStorageProvider() === 'supabase') {
+      await uploadFileToStorage({
+        localPath: req.file.path,
+        objectKey: relativePath,
+        contentType: req.file.mimetype,
+        deleteLocal: true,
+      })
+    }
+
     const updated = await prisma.question.update({
       where: { id },
       data: {
@@ -246,6 +266,15 @@ router.get('/questions/:id/template/download', authenticate, async (req, res) =>
 
     if (!question.templatePath) {
       return res.status(404).json({ error: 'Nenhum arquivo-modelo anexado' })
+    }
+
+    if (getStorageProvider() === 'supabase') {
+      const storedPath = `uploads/${stripUploadsPrefix(question.templatePath)}`
+      const signedUrl = await createSignedUrlForStoredPath(storedPath)
+      if (!signedUrl) {
+        return res.status(404).json({ error: 'Arquivo-modelo não encontrado' })
+      }
+      return res.redirect(signedUrl)
     }
 
     // NOTE: templatePath é salvo como caminho relativo (sem garantir prefixo 'uploads/')
@@ -351,6 +380,15 @@ router.post('/answers/:answerId/evidences', authenticate, uploadMultiple, async 
           .replace(/\\/g, '/')
           .replace(/^\/+/, '')
         const publicPath = relative ? `uploads/${relative}` : `uploads/${file.filename}`;
+
+        if (getStorageProvider() === 'supabase') {
+          await uploadFileToStorage({
+            localPath: file.path,
+            objectKey: relative,
+            contentType: file.mimetype,
+            deleteLocal: true,
+          })
+        }
 
         return await prisma.evidence.create({
           data: {
