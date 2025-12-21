@@ -2,23 +2,26 @@ import multer from 'multer';
 import path from 'path';
 import fs from 'fs';
 import { Request } from 'express';
+import { ensureDir, getUploadsRoot } from './paths'
 
 // Garantir que a pasta de uploads existe
-const uploadDir = process.env.UPLOAD_PATH || './uploads';
-if (!fs.existsSync(uploadDir)) {
-  fs.mkdirSync(uploadDir, { recursive: true });
-}
+const uploadDir = getUploadsRoot();
+ensureDir(uploadDir)
 
 // Configuração de armazenamento
 const storage = multer.diskStorage({
   destination: (req: Request, file, cb) => {
-    // Criar subpasta para cada resposta se necessário
-    const subDir = req.params.answerId ? `answer_${req.params.answerId}` : 'general';
-    const fullPath = path.join(uploadDir, subDir);
-    
-    if (!fs.existsSync(fullPath)) {
-      fs.mkdirSync(fullPath, { recursive: true });
+    // Criar subpasta: resposta ou template de pergunta
+    let subDir = 'general';
+    if (req.params.answerId) {
+      subDir = `answer_${req.params.answerId}`;
+    } else if (req.params.id) {
+      subDir = `question_${req.params.id}`;
     }
+
+    const fullPath = path.join(uploadDir, subDir);
+
+    ensureDir(fullPath)
     
     cb(null, fullPath);
   },
@@ -36,8 +39,11 @@ const fileFilter = (req: Request, file: Express.Multer.File, cb: multer.FileFilt
     'image/png',
     'image/gif',
     'application/pdf',
+    'text/plain',
     'application/msword',
-    'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+    'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    'application/vnd.ms-excel',
+    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
   ];
 
   if (allowedMimes.includes(file.mimetype)) {

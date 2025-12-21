@@ -1,23 +1,76 @@
 import express from 'express'
 import cors from 'cors'
+import helmet from 'helmet'
+import morgan from 'morgan'
 import { config } from 'dotenv'
+import path from 'path'
+import { getUploadsRoot } from './config/paths'
 
 config()
 
 const app = express()
-app.use(cors())
-app.use(express.json())
+
+// Segurança básica
+app.use(helmet())
+
+// Não expor assinatura do framework
+app.disable('x-powered-by')
+
+// CORS - configure via CORS_ORIGIN (lista separada por vírgula). Ex: "https://app.com,http://localhost:5173"
+const corsAllowlist = (process.env.CORS_ORIGIN || '')
+  .split(',')
+  .map((o) => o.trim())
+  .filter(Boolean)
+
+app.use(
+  cors({
+    origin: (origin, cb) => {
+      // Permitir requests sem Origin (curl, Postman, server-to-server)
+      if (!origin) return cb(null, true)
+
+      // Se não configurado, permitir apenas localhost em dev
+      if (corsAllowlist.length === 0) {
+        const isLocalhost = /^https?:\/\/localhost(:\d+)?$/.test(origin)
+        return cb(null, process.env.NODE_ENV !== 'production' && isLocalhost)
+      }
+
+      return cb(null, corsAllowlist.includes(origin))
+    },
+    credentials: true,
+  })
+)
+
+// Logs de requisição
+app.use(morgan('combined'))
+
+// Body parser
+app.use(express.json({ limit: '10mb' }))
 
 // Test route
 app.get('/', (req, res) => {
   res.json({ message: 'Formulário PLD API' })
 })
 
+// Rotas de autenticação
+import authRoutes from './routes/auth.routes'
+app.use('/api/auth', authRoutes)
+
 // Importar rotas do formulário
-import  formRoutes  from './routes/form.routes'
-import path from 'path/win32'
+import formRoutes from './routes/form.routes'
+import reportRoutes from './routes/report.routes'
+import pldBuilderRoutes from './routes/pldBuilder.routes'
 app.use('/api/form', formRoutes)
-app.use('/uploads', express.static(path.join(__dirname, '../uploads')));
+app.use('/api/report', reportRoutes)
+app.use('/api/pld', pldBuilderRoutes)
+
+// Arquivos estáticos (uploads, evidências, relatórios)
+app.use(
+  '/uploads',
+  express.static(getUploadsRoot(), {
+    index: false,
+    dotfiles: 'deny',
+  })
+)
 
 const PORT = process.env.PORT || 3001
 app.listen(PORT, () => {

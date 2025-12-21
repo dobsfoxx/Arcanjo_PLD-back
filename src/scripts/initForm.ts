@@ -1,7 +1,13 @@
 import { FormService } from '../services/form.services'
+import prisma from '../config/database'
 
 async function initializeForm() {
   console.log('🚀 Inicializando formulário PLD...')
+
+  const admin = await prisma.user.findFirst({ where: { role: 'ADMIN' } })
+  if (!admin) {
+    throw new Error('Nenhum usuário ADMIN encontrado. Crie um ADMIN antes de executar o seed.')
+  }
   
   // Tópicos do PLD (conforme seu documento)
   const topics = [
@@ -28,34 +34,33 @@ async function initializeForm() {
   ]
   
   // Perguntas exemplo para cada tópico
-  const questionsByTopic: Record<string, string[]> = {
+  const questionsByTopic: { [key: string]: string[] } = {
     'Política (PI)': [
-      'A política de PLD está formalmente documentada e aprovada pela alta administração?',
-      'A política é revisada periodicamente?',
-      'Todos os funcionários têm acesso à política?'
+      'A política de PLD está atualizada?',
     ],
     'Avaliação Interna de Risco (AIR)': [
-      'A instituição realiza avaliação de riscos de PLD regularmente?',
-      'A avaliação cobre produtos, serviços, clientes e canais de distribuição?',
-      'Os resultados são documentados e usados para mitigação?'
+      'Quais são os principais riscos identificados?',
+    ],
+    'Avaliação de Novos Produtos (ANPST)': [
+      'Os novos produtos foram avaliados quanto ao risco de PLD?',
+    ],
+    'Governança (GOV)': [
+      'Existe um comitê de compliance ativo?',
     ],
     'Conheça seu Cliente (CSC)': [
-      'Há procedimentos para identificação e verificação de clientes?',
-      'É realizado monitoramento contínuo das transações?',
-      'Existe classificação de clientes por nível de risco?'
-    ]
+      'Os procedimentos de due diligence são seguidos corretamente?',
+    ],
   }
-  
   try {
     // Criar tópicos
     console.log('📝 Criando tópicos...')
     for (const topic of topics) {
-      await FormService.createTopic(topic.name, topic.description)
+      await FormService.createTopic(admin.id, topic.name, topic.description)
       console.log(`✅ Tópico criado: ${topic.name}`)
     }
     
     // Buscar tópicos criados
-    const createdTopics = await FormService.getTopics()
+    const createdTopics = await FormService.getTopics(admin.id, 'ADMIN')
     
     // Criar perguntas para cada tópico
     console.log('\n📝 Criando perguntas...')
@@ -72,10 +77,6 @@ async function initializeForm() {
         console.log(`✅ Pergunta criada em ${topic.name}: ${questionText.substring(0, 50)}...`)
       }
     }
-    
-    // Calcular progresso inicial
-    const progress = await FormService.calculateProgress()
-    console.log('\n📊 Progresso inicial:', progress)
     
     console.log('\n🎉 Formulário inicializado com sucesso!')
     console.log('📊 Tópicos criados:', createdTopics.length)

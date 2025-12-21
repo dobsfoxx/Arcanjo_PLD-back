@@ -2,40 +2,110 @@ import prisma from '../config/database'
 
 export class FormService {
   // =========== TÓPICOS ===========
-  
- 
-  static async createTopic(name: string, description?: string, internalNorm?: string) {
+
+  static async createTopic(
+    userId: string,
+    name: string,
+    description?: string,
+    internalNorm?: string
+  ) {
     // Contar tópicos para definir ordem
     const count = await prisma.topic.count()
-    
+
     return await prisma.topic.create({
       data: {
         name,
         description,
         internalNorm,
-        order: count
-      }
+        order: count,
+        userId,
+      },
     })
   }
-  
-  // Listar todos tópicos com suas perguntas
-  static async getTopics() {
-    return await prisma.topic.findMany({
-      where: { isActive: true },
+
+  // Listar tópicos com perguntas, trazendo apenas a resposta do usuário atual.
+  // ADMIN vê todos os tópicos; USER só vê tópicos atribuídos a ele.
+  static async getTopics(userId: string, role: string) {
+    const where: any = { isActive: true }
+
+    if (role !== 'ADMIN') {
+      where.assignedToId = userId
+    }
+
+    const topics = await (prisma as any).topic.findMany({
+      where,
       include: {
+        assignedTo: {
+          select: { id: true, name: true, email: true },
+        },
         questions: {
           include: {
-            answer: {
+            answers: {
+              where: { userId },
               include: {
-                evidences: true
-              }
-            }
+                evidences: true,
+              },
+            },
           },
-          orderBy: { order: 'asc' }
-        }
+          orderBy: { order: 'asc' },
+        },
       },
-      orderBy: { order: 'asc' }
+      orderBy: { order: 'asc' },
     })
+
+    // Adaptar para o formato esperado pelo frontend: question.answer (única)
+    const adapted = (topics as any[]).map((topic: any) => ({
+      ...topic,
+      questions: (topic.questions as any[]).map((question: any) => {
+        const { answers, ...rest } = question
+        return {
+          ...rest,
+          answer: answers && answers.length > 0 ? answers[0] : null,
+        }
+      }),
+    }))
+
+    return adapted
+  }
+
+  // Listar tópicos para revisão de um usuário específico (ADMIN)
+  static async getTopicsByAssignee(assigneeId: string) {
+    const topics = await (prisma as any).topic.findMany({
+      where: {
+        isActive: true,
+        assignedToId: assigneeId,
+      },
+      include: {
+        assignedTo: {
+          select: { id: true, name: true, email: true },
+        },
+        questions: {
+          include: {
+            answers: {
+              where: { userId: assigneeId },
+              include: {
+                evidences: true,
+              },
+            },
+          },
+          orderBy: { order: 'asc' },
+        },
+      },
+      orderBy: { order: 'asc' },
+    })
+
+    const adapted = (topics as any[]).map((topic: any) => ({
+      ...topic,
+      questions: (topic.questions as any[]).map((question: any) => {
+        const { answers, ...rest } = question
+        return {
+          ...rest,
+          answer: answers && answers.length > 0 ? answers[0] : null,
+        }
+      }),
+    }))
+
+    return adapted
   }
   
   // Reordenar tópicos
@@ -79,7 +149,8 @@ export class FormService {
     topicId: string, 
     title: string, 
     description?: string, 
-    criticality: string = 'MEDIA'
+    criticality: string = 'MEDIA',
+    capitulation?: string
   ) {
     // Verificar se tópico existe
     const topic = await prisma.topic.findUnique({
@@ -98,6 +169,7 @@ export class FormService {
     return await prisma.question.create({
       data: {
         title,
+        capitulation: capitulation ? capitulation.slice(0, 200) : undefined,
         description,
         criticality,
         topicId,
@@ -107,10 +179,41 @@ export class FormService {
   }
   
   // Marcar pergunta como não aplicável
-  static async toggleQuestionApplicable(questionId: string, isApplicable: boolean) {
+  static async toggleQuestionApplicable(
+    questionId: string,
+    isApplicable: boolean,
+    actorId: string,
+    actorRole: string
+  ) {
+    if (actorRole === 'ADMIN') {
+      return await prisma.question.update({
+        where: { id: questionId },
+        data: { isApplicable },
+      })
+    }
+
+    const question = await (prisma as any).question.findUnique({
+      where: { id: questionId },
+      include: { topic: true },
+    }) as any
+
+    if (!question) {
+      throw new Error('Pergunta não encontrada')
+    }
+
+    if (!question.topic?.assignedToId || question.topic.assignedToId !== actorId) {
+      throw new Error('Não é permitido alterar perguntas de outro usuário')
+    }
+
+    // Usuário só pode alterar enquanto está preenchendo (ou ajustando após devolução)
+    const status = question.topic.status as string | undefined
+    if (!status || !['ASSIGNED', 'IN_PROGRESS', 'RETURNED'].includes(status)) {
+      throw new Error('Tópico não está em edição para alterar aplicabilidade')
+    }
+
     return await prisma.question.update({
       where: { id: questionId },
-      data: { isApplicable }
+      data: { isApplicable },
     })
   }
   
@@ -131,33 +234,51 @@ export class FormService {
   
   // =========== RESPOSTAS ===========
   
-
   static async answerQuestion(
     questionId: string,
+    userId: string,
     response: boolean, // Sim ou Não
     justification?: string,
-    deficiency?: string,
-    recommendation?: string
+    testOption?: string,
+    testDescription?: string,
+    correctiveActionPlan?: string,
   ) {
-    // Validar: se resposta = NÃO, deve ter deficiência e recomendação
-    if (response === false) {
-      if (!deficiency || !recommendation) {
-        throw new Error('Para resposta "Não", é obrigatório informar deficiência e recomendação')
+    // Validações para o fluxo de teste
+    if (testOption === 'SIM') {
+      if (testDescription && testDescription.length > 300) {
+        throw new Error('Descrição do teste deve ter até 300 caracteres')
       }
     }
+
+    if (testOption === 'CORRETIVA') {
+      if (!correctiveActionPlan || !correctiveActionPlan.trim()) {
+        throw new Error('Plano de ação corretiva é obrigatório quando há plano em andamento')
+      }
+      if (correctiveActionPlan.length > 200) {
+        throw new Error('Plano de ação corretiva deve ter até 200 caracteres')
+      }
+    }
+    // Usuário só informa resposta e justificativa; deficiência/recomendação são preenchidas pelo admin na revisão
     
-    // Verificar se pergunta existe
-    const question = await prisma.question.findUnique({
-      where: { id: questionId }
-    })
-    
+    // Verificar se pergunta existe e se o tópico está atribuído ao usuário
+    const question = await (prisma as any).question.findUnique({
+      where: { id: questionId },
+      include: {
+        topic: true,
+      },
+    }) as any
+
     if (!question) {
-      throw new Error('Pergunta não encontrado')
+      throw new Error('Pergunta não encontrada')
+    }
+
+    if (!question.topic.assignedToId || question.topic.assignedToId !== userId) {
+      throw new Error('Este tópico não está atribuído a você para resposta')
     }
     
-    // Criar ou atualizar resposta
-    const existingAnswer = await prisma.answer.findUnique({
-      where: { questionId }
+    // Criar ou atualizar resposta do usuário
+    const existingAnswer = await prisma.answer.findFirst({
+      where: { questionId, userId },
     })
     
     if (existingAnswer) {
@@ -167,29 +288,111 @@ export class FormService {
         data: {
           response,
           justification,
-          deficiency: response ? null : deficiency, // Só salva se for Não
-          recommendation: response ? null : recommendation // Só salva se for Não
+          testOption,
+          testDescription,
+          correctiveActionPlan,
         }
       })
     } else {
-      // Criar nova resposta SEM userId
+      // Primeira resposta deste usuário neste tópico: marcar como EM ANDAMENTO
+      if (question.topic.status === 'ASSIGNED' || question.topic.status === 'RETURNED') {
+        await (prisma as any).topic.update({
+          where: { id: question.topicId },
+          data: { status: 'IN_PROGRESS' },
+        })
+      }
+
       return await prisma.answer.create({
         data: {
           response,
           justification,
-          deficiency: response ? null : deficiency,
-          recommendation: response ? null : recommendation,
-          questionId
-          // ⚠️ Não passa userId - será NULL
+          testOption,
+          testDescription,
+          correctiveActionPlan,
+          deficiency: null,
+          recommendation: null,
+          questionId,
+          userId,
         }
       })
     }
   }
+
+  // ADMIN: atualizar resposta de um usuário específico durante revisão
+  static async adminUpdateAnswer(
+    questionId: string,
+    assigneeId: string,
+    response: boolean,
+    justification?: string,
+    deficiency?: string,
+    recommendation?: string,
+    testOption?: string,
+    testDescription?: string,
+    correctiveActionPlan?: string,
+  ) {
+    if (testOption === 'SIM') {
+      if (testDescription && testDescription.length > 300) {
+        throw new Error('Descrição do teste deve ter até 300 caracteres')
+      }
+    }
+
+    if (testOption === 'CORRETIVA') {
+      if (!correctiveActionPlan || !correctiveActionPlan.trim()) {
+        throw new Error('Plano de ação corretiva é obrigatório quando há plano em andamento')
+      }
+      if (correctiveActionPlan.length > 200) {
+        throw new Error('Plano de ação corretiva deve ter até 200 caracteres')
+      }
+    }
+    if (response === false) {
+      if (!deficiency || !recommendation) {
+        throw new Error('Para resposta "Não", é obrigatório informar deficiência e recomendação')
+      }
+    }
+
+    const question = await (prisma as any).question.findUnique({
+      where: { id: questionId },
+      include: { topic: true },
+    }) as any
+
+    if (!question) {
+      throw new Error('Pergunta não encontrada')
+    }
+
+    if (!question.topic.assignedToId || question.topic.assignedToId !== assigneeId) {
+      throw new Error('Tópico não está atribuído a este usuário')
+    }
+
+    const existingAnswer = await prisma.answer.findFirst({
+      where: { questionId, userId: assigneeId },
+      include: { evidences: true },
+    })
+
+    if (!existingAnswer) {
+      throw new Error('Resposta do usuário não encontrada para esta pergunta')
+    }
+
+    return await prisma.answer.update({
+      where: { id: existingAnswer.id },
+      data: {
+        response,
+        justification,
+        deficiency: response ? null : deficiency,
+        recommendation: response ? null : recommendation,
+        testOption,
+        testDescription,
+        correctiveActionPlan,
+      },
+      include: {
+        evidences: true,
+      },
+    })
+  }
   
   // Buscar resposta de uma pergunta
-  static async getAnswer(questionId: string) {
-    return await prisma.answer.findUnique({
-      where: { questionId },
+  static async getAnswer(questionId: string, userId: string) {
+    return await prisma.answer.findFirst({
+      where: { questionId, userId },
       include: {
         evidences: true
       }
@@ -229,65 +432,75 @@ export class FormService {
   // =========== PROGRESSO ===========
   
   // Calcular progresso geral
-  static async calculateProgress() {
-    const topics = await prisma.topic.findMany({
+  static async calculateProgress(userId: string) {
+    const topics = await (prisma as any).topic.findMany({
       where: { isActive: true },
       include: {
         questions: {
           include: {
-            answer: true
-          }
-        }
-      }
+            answers: {
+              where: { userId },
+            },
+          },
+        },
+      },
     })
-    
+
+    const topicList = (topics as any[]) || []
+
     let totalApplicable = 0
     let totalAnswered = 0
-    
-    topics.forEach(topic => {
-      topic.questions.forEach(question => {
-        // Só conta perguntas aplicáveis
+    let totalQuestions = 0
+
+    for (const topic of topicList) {
+      const questions = (topic.questions as any[]) || []
+      totalQuestions += questions.length
+
+      for (const question of questions) {
         if (question.isApplicable) {
           totalApplicable++
-          if (question.answer) {
+          if (question.answers && question.answers.length > 0) {
             totalAnswered++
           }
         }
-      })
-    })
-    
-    const progress = totalApplicable > 0 
+      }
+    }
+
+    const progress = totalApplicable > 0
       ? Math.round((totalAnswered / totalApplicable) * 100)
       : 0
-    
+
     return {
       progress,
       totalApplicable,
       totalAnswered,
-      totalQuestions: topics.reduce((acc, topic) => acc + topic.questions.length, 0)
+      totalQuestions,
     }
   }
   
   // Calcular progresso por tópico
-  static async calculateTopicProgress(topicId: string) {
-    const topic = await prisma.topic.findUnique({
+  static async calculateTopicProgress(topicId: string, userId: string) {
+    const topic = await (prisma as any).topic.findUnique({
       where: { id: topicId },
       include: {
         questions: {
           include: {
-            answer: true
-          }
-        }
-      }
+            answers: {
+              where: { userId },
+            },
+          },
+        },
+      },
     })
     
     if (!topic) {
       throw new Error('Tópico não encontrado')
     }
     
-    
-    const applicableQuestions = topic.questions.filter(q => q.isApplicable)
-    const answeredQuestions = applicableQuestions.filter(q => q.answer)
+    const applicableQuestions = (topic.questions as any[]).filter((q: any) => q.isApplicable)
+    const answeredQuestions = applicableQuestions.filter(
+      (q: any) => q.answers && q.answers.length > 0
+    )
     
     const progress = applicableQuestions.length > 0
       ? Math.round((answeredQuestions.length / applicableQuestions.length) * 100)
@@ -299,72 +512,285 @@ export class FormService {
       progress,
       applicableCount: applicableQuestions.length,
       answeredCount: answeredQuestions.length,
-      totalQuestions: topic.questions.length
+      totalQuestions: (topic.questions as any[]).length
     }
   }
   
   // =========== DADOS DO FORMULÁRIO ===========
   
   // Pegar todos os dados do formulário (para relatório)
-  static async getFormData() {
-    return await prisma.topic.findMany({
+  static async getFormData(userId: string) {
+    const topics = await (prisma as any).topic.findMany({
       where: { isActive: true },
       include: {
         questions: {
           include: {
-            answer: {
+            answers: {
+              where: { userId },
               include: {
-                evidences: true
-              }
-            }
+                evidences: true,
+              },
+            },
           },
-          orderBy: { order: 'asc' }
-        }
+          orderBy: { order: 'asc' },
+        },
       },
-      orderBy: { order: 'asc' }
+      orderBy: { order: 'asc' },
     })
-    
+
+    const adapted = (topics as any[]).map((topic: any) => ({
+      ...topic,
+      questions: (topic.questions as any[]).map((question: any) => {
+        const { answers, ...rest } = question
+        return {
+          ...rest,
+          answer: answers && answers.length > 0 ? answers[0] : null,
+        }
+      }),
+    }))
+
+    return adapted
   }
   // Em src/services/form.service.ts
 
-// Deletar pergunta
-static async deleteQuestion(questionId: string) {
-  const question = await prisma.question.delete({
-    where: { id: questionId }
-  });
+  // Deletar pergunta
+  static async deleteQuestion(questionId: string) {
+    const question = await prisma.question.delete({
+      where: { id: questionId },
+    })
 
-  // Reordenar perguntas restantes do tópico
-  const remainingQuestions = await prisma.question.findMany({
-    where: { topicId: question.topicId },
-    orderBy: { order: 'asc' }
-  });
+    // Reordenar perguntas restantes do tópico
+    const remainingQuestions = await prisma.question.findMany({
+      where: { topicId: question.topicId },
+      orderBy: { order: 'asc' },
+    })
 
-  await Promise.all(
-    remainingQuestions.map((q, index) =>
-      prisma.question.update({
-        where: { id: q.id },
-        data: { order: index }
-      })
+    await Promise.all(
+      remainingQuestions.map((q, index) =>
+        prisma.question.update({
+          where: { id: q.id },
+          data: { order: index },
+        })
+      )
     )
-  );
 
-  return question;
-}
-
-// Atualizar pergunta
-static async updateQuestion(
-  questionId: string,
-  data: {
-    title?: string;
-    description?: string;
-    criticality?: string;
-    normReference?: string;
-    normFileUrl?: string;
+    return question
   }
-) {
-  return await prisma.question.update({
-    where: { id: questionId },
-    data
-  });
-}
+
+  // Atualizar pergunta
+  static async updateQuestion(
+    questionId: string,
+    data: {
+      title?: string
+      description?: string
+      criticality?: string
+      normReference?: string
+      normFileUrl?: string
+    }
+  ) {
+    return await prisma.question.update({
+      where: { id: questionId },
+      data,
+    })
+  }
+
+  // =========== WORKFLOW DE TÓPICOS ===========
+
+  // ADMIN: atribuir tópico a um usuário (por e-mail)
+  static async assignTopicToUser(topicId: string, adminId: string, email: string) {
+    const topic = (await (prisma as any).topic.findUnique({ where: { id: topicId } })) as any
+    if (!topic) {
+      throw new Error('Tópico não encontrado')
+    }
+
+    // Opcional: garantir que o admin é o criador do tópico
+    if (topic.userId !== adminId) {
+      throw new Error('Apenas o criador do tópico pode atribuí-lo')
+    }
+
+    const user = await prisma.user.findUnique({ where: { email } })
+    if (!user) {
+      throw new Error('Usuário não encontrado para o e-mail informado')
+    }
+
+    // Usar any para evitar problemas de tipagem até o client ser regenerado
+    const updated = await (prisma as any).topic.update({
+      where: { id: topicId },
+      data: {
+        assignedToId: user.id,
+        status: 'ASSIGNED',
+      },
+      include: {
+        assignedTo: {
+          select: { id: true, name: true, email: true },
+        },
+      },
+    })
+
+    return updated as any
+  }
+
+  // ADMIN: atribuir TODOS os tópicos criados por ele a um usuário (por e-mail)
+  static async assignAllTopicsToUser(adminId: string, email: string) {
+    const user = await prisma.user.findUnique({ where: { email } })
+    if (!user) {
+      throw new Error('Usuário não encontrado para o e-mail informado')
+    }
+
+    const topics = await prisma.topic.findMany({
+      where: {
+        userId: adminId,
+        isActive: true,
+      },
+    })
+
+    if (!topics || topics.length === 0) {
+      throw new Error('Nenhum tópico encontrado para este administrador')
+    }
+
+    await (prisma as any).topic.updateMany({
+      where: {
+        userId: adminId,
+        isActive: true,
+      },
+      data: {
+        assignedToId: user.id,
+        status: 'ASSIGNED',
+      },
+    })
+
+    const updatedTopics = await (prisma as any).topic.findMany({
+      where: {
+        userId: adminId,
+        isActive: true,
+      },
+      include: {
+        assignedTo: {
+          select: { id: true, name: true, email: true },
+        },
+      },
+    })
+
+    return updatedTopics as any
+  }
+
+  // USER: enviar respostas para revisão do administrador
+  static async submitTopic(topicId: string, userId: string) {
+    const topic = await prisma.topic.findUnique({ where: { id: topicId } })
+    if (!topic) {
+      throw new Error('Tópico não encontrado')
+    }
+
+    if (!(topic as any).assignedToId || (topic as any).assignedToId !== userId) {
+      throw new Error('Tópico não atribuído a este usuário')
+    }
+
+    if ((topic as any).status !== 'IN_PROGRESS' && (topic as any).status !== 'RETURNED') {
+      throw new Error('Tópico não está em edição para ser enviado')
+    }
+
+    return await (prisma as any).topic.update({
+      where: { id: topicId },
+      data: { status: 'SUBMITTED' },
+    })
+  }
+
+  // USER: enviar TODOS os tópicos atribuídos para revisão do administrador
+  static async submitAllTopics(userId: string) {
+    const topics = await (prisma as any).topic.findMany({
+      where: {
+        assignedToId: userId,
+        isActive: true,
+        status: {
+          in: ['IN_PROGRESS', 'RETURNED'],
+        },
+      },
+    }) as any[]
+
+    if (!topics || topics.length === 0) {
+      throw new Error('Não há tópicos em edição para enviar para revisão')
+    }
+
+    await (prisma as any).topic.updateMany({
+      where: {
+        assignedToId: userId,
+        isActive: true,
+        status: {
+          in: ['IN_PROGRESS', 'RETURNED'],
+        },
+      },
+      data: {
+        status: 'SUBMITTED',
+      },
+    })
+
+    const updated = await (prisma as any).topic.findMany({
+      where: {
+        assignedToId: userId,
+        isActive: true,
+      },
+    })
+
+    return updated as any
+  }
+
+  // ADMIN: devolver tópico para ajustes do usuário
+  static async returnTopic(topicId: string, adminId: string) {
+    const topic = await (prisma as any).topic.findUnique({ where: { id: topicId } }) as any
+    if (!topic) {
+      throw new Error('Tópico não encontrado')
+    }
+
+    // Permissão: a rota já exige admin (requireAdmin).
+    // Regra de workflow: só pode devolver quando estiver em revisão.
+    if (topic.status !== 'SUBMITTED' && topic.status !== 'IN_REVIEW') {
+      throw new Error('Tópico não está enviado para revisão')
+    }
+
+    return await (prisma as any).topic.update({
+      where: { id: topicId },
+      data: { status: 'RETURNED' },
+    })
+  }
+
+  // ADMIN: devolver TODOS os tópicos enviados de um usuário para ajustes
+  static async returnAllTopicsForUser(assigneeId: string, adminId: string) {
+    await (prisma as any).topic.updateMany({
+      where: {
+        assignedToId: assigneeId,
+        isActive: true,
+        status: {
+          in: ['SUBMITTED', 'IN_REVIEW'],
+        },
+      },
+      data: { status: 'RETURNED' },
+    })
+
+    const updated = await (prisma as any).topic.findMany({
+      where: {
+        assignedToId: assigneeId,
+        isActive: true,
+      },
+    })
+
+    return updated as any
+  }
+
+  // ADMIN: aprovar/concluir tópico
+  static async approveTopic(topicId: string, adminId: string) {
+    const topic = await (prisma as any).topic.findUnique({ where: { id: topicId } }) as any
+    if (!topic) {
+      throw new Error('Tópico não encontrado')
+    }
+
+    // Permissão: a rota já exige admin (requireAdmin).
+    if (topic.status !== 'SUBMITTED' && topic.status !== 'IN_REVIEW') {
+      throw new Error('Tópico não está enviado para revisão')
+    }
+
+    return await (prisma as any).topic.update({
+      where: { id: topicId },
+      data: { status: 'COMPLETED' },
+    })
+  }
 }

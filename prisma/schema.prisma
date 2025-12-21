@@ -7,103 +7,241 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
+// =====================
+// NOVO BUILDER PLD
+// =====================
+
+enum PldCriticidade {
+  BAIXA
+  MEDIA
+  ALTA
+}
+
+enum PldTesteStatus {
+  SIM
+  NAO
+  NAO_PLANO
+}
+
 model User {
-  id                String    @id @default(cuid())
-  email             String    @unique
-  password          String
-  name              String
-  isTrial           Boolean   @default(true)
-  trialExpiresAt    DateTime?
-  isActive          Boolean   @default(true)
-  role              String    @default("USER")
-  createdAt         DateTime  @default(now())
-  updatedAt         DateTime  @updatedAt
-  
-  topics            Topic[]
-  answers           Answer[]
-  reports           Report[]
-  
+  id             String    @id @default(cuid())
+  email          String    @unique
+  password       String
+  name           String
+  isTrial        Boolean   @default(true)
+  trialExpiresAt DateTime?
+  isActive       Boolean   @default(true)
+  role           String    @default("USER")
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  // Tópicos criados por este usuário (normalmente ADMIN)
+  topics         Topic[] @relation("TopicOwner")
+  // Tópicos atribuídos a este usuário para resposta
+  assignedTopics Topic[] @relation("TopicAssignedTo")
+
+  answers             Answer[]
+  reports             Report[]
+  passwordResetTokens PasswordResetToken[]
+  createdPldSections   PldSection[]       @relation("PldSectionCreatedBy")
+
   @@map("users")
 }
 
+enum WorkflowStatus {
+  DRAFT
+  ASSIGNED
+  IN_PROGRESS
+  SUBMITTED
+  IN_REVIEW
+  RETURNED
+  COMPLETED
+}
+
 model Topic {
-  id                String    @id @default(cuid())
-  name              String
-  internalNorm      String?
-  description       String?
-  order             Int       @default(0)
-  isActive          Boolean   @default(true)
-  userId            String
-  createdAt         DateTime  @default(now())
-  updatedAt         DateTime  @updatedAt
-  
-  user              User      @relation(fields: [userId], references: [id], onDelete: Cascade)
-  questions         Question[]
-  
+  id           String         @id @default(cuid())
+  name         String
+  internalNorm String?
+  normFilename     String?
+  normOriginalName String?
+  normPath         String?
+  normMimeType     String?
+  normSize         Int?
+  description  String?
+  order        Int            @default(0)
+  isActive     Boolean        @default(true)
+  userId       String
+  // Usuário ao qual o tópico foi atribuído para resposta
+  assignedToId String?
+  status       WorkflowStatus @default(DRAFT)
+  createdAt    DateTime       @default(now())
+  updatedAt    DateTime       @updatedAt
+
+  user       User       @relation("TopicOwner", fields: [userId], references: [id], onDelete: Cascade)
+  assignedTo User?      @relation("TopicAssignedTo", fields: [assignedToId], references: [id])
+  questions  Question[]
+
   @@map("topics")
 }
 
 model Question {
-  id                String     @id @default(cuid())
-  title             String
-  description       String?
-  isApplicable      Boolean    @default(true)
-  criticality       String     @default("MEDIA")
-  order             Int        @default(0)
-  topicId           String
-  createdAt         DateTime   @default(now())
-  updatedAt         DateTime   @updatedAt
-  
-  topic             Topic      @relation(fields: [topicId], references: [id], onDelete: Cascade)
-  answer            Answer?
-  
+  id           String   @id @default(cuid())
+  title        String
+  capitulation String?
+  description  String?
+  isApplicable Boolean  @default(true)
+  criticality  String   @default("MEDIA")
+  order        Int      @default(0)
+  templateFilename     String?
+  templateOriginalName String?
+  templatePath         String?
+  templateMimeType     String?
+  templateSize         Int?
+  topicId      String
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  topic   Topic    @relation(fields: [topicId], references: [id], onDelete: Cascade)
+  answers Answer[]
+
   @@map("questions")
 }
 
 model Answer {
-  id                String     @id @default(cuid())
-  response          Boolean
-  justification     String?
-  deficiency        String?
-  recommendation    String?
-  questionId        String     @unique
-  userId            String
-  createdAt         DateTime   @default(now())
-  updatedAt         DateTime   @updatedAt
-  
-  question          Question   @relation(fields: [questionId], references: [id], onDelete: Cascade)
-  user              User       @relation(fields: [userId], references: [id], onDelete: Cascade)
-  evidences         Evidence[]
-  
+  id             String   @id @default(cuid())
+  response       Boolean
+  justification  String?
+  testOption     String?
+  testDescription String?
+  correctiveActionPlan String?
+  deficiency     String?
+  recommendation String?
+  questionId     String
+  userId         String
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  question  Question   @relation(fields: [questionId], references: [id], onDelete: Cascade)
+  user      User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  evidences Evidence[]
+
+  @@unique([questionId, userId])
   @@map("answers")
 }
 
 model Evidence {
-  id                String     @id @default(cuid())
-  filename          String
-  originalName      String
-  path              String
-  mimeType          String
-  size              Int
-  answerId          String
-  uploadedAt        DateTime   @default(now())
-  
-  answer            Answer     @relation(fields: [answerId], references: [id], onDelete: Cascade)
-  
+  id           String   @id @default(cuid())
+  filename     String
+  originalName String
+  path         String
+  mimeType     String
+  size         Int
+  category     String   @default("GENERAL")
+  answerId     String
+  uploadedAt   DateTime @default(now())
+
+  answer Answer @relation(fields: [answerId], references: [id], onDelete: Cascade)
+
   @@map("evidences")
 }
 
 model Report {
-  id                String     @id @default(cuid())
-  name              String
-  type              String     @default("FULL")
-  format            String     @default("PDF")
-  content           String?
-  filePath          String?
-  userId            String
-  createdAt         DateTime   @default(now())
-  
-  user              User       @relation(fields: [userId], references: [id], onDelete: Cascade)
-  
+  id        String   @id @default(cuid())
+  name      String
+  type      String   @default("FULL")
+  format    String   @default("PDF")
+  content   String?
+  filePath  String?
+  userId    String
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
   @@map("reports")
+}
+
+model PasswordResetToken {
+  id        String    @id @default(cuid())
+  token     String    @unique
+  userId    String
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  @@map("password_reset_tokens")
+}
+
+// ===============
+// Novo builder PLD
+// ===============
+
+model PldSection {
+  id              String   @id @default(cuid())
+  item            String
+  customLabel     String?
+  hasNorma        Boolean  @default(false)
+  normaReferencia String?
+  descricao       String?
+  order           Int      @default(0)
+  createdById     String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  createdBy   User?           @relation("PldSectionCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  questions   PldQuestion[]
+  attachments PldAttachment[]
+
+  @@map("pld_sections")
+}
+
+model PldQuestion {
+  id                     String         @id @default(cuid())
+  sectionId              String
+  order                  Int            @default(0)
+  texto                  String
+  aplicavel              Boolean        @default(true)
+  respondida             Boolean        @default(false)
+  templateRef            String?
+  capitulacao            String?
+  criticidade            PldCriticidade @default(MEDIA)
+  resposta               String?
+  respostaTexto          String?
+  deficienciaTexto       String?
+  recomendacaoTexto      String?
+  testStatus             PldTesteStatus?
+  testDescription        String?
+  actionOrigem           String?
+  actionResponsavel      String?
+  actionDescricao        String?
+  actionDataApontamento  DateTime?
+  actionPrazoOriginal    DateTime?
+  actionPrazoAtual       DateTime?
+  actionComentarios      String?
+  createdAt              DateTime       @default(now())
+  updatedAt              DateTime       @updatedAt
+
+  section     PldSection     @relation(fields: [sectionId], references: [id], onDelete: Cascade)
+  attachments PldAttachment[]
+
+  @@map("pld_questions")
+}
+
+model PldAttachment {
+  id            String   @id @default(cuid())
+  sectionId     String?
+  questionId    String?
+  category      String
+  referenceText String?
+  filename      String
+  originalName  String
+  path          String
+  mimeType      String
+  size          Int
+  createdAt     DateTime @default(now())
+
+  section  PldSection?  @relation(fields: [sectionId], references: [id], onDelete: Cascade)
+  question PldQuestion? @relation(fields: [questionId], references: [id], onDelete: Cascade)
+
+  @@map("pld_attachments")
 }
