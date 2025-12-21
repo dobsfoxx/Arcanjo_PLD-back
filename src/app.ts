@@ -65,28 +65,31 @@ app.use('/api/report', reportRoutes)
 app.use('/api/pld', pldBuilderRoutes)
 
 // Arquivos estáticos (uploads, evidências, relatórios)
-if (getStorageProvider() === 'supabase') {
-  // Express 5 / path-to-regexp requires a named wildcard param
-  app.get('/uploads/*path', async (req, res) => {
-    try {
-      const raw = (req.params as any).path as unknown
-      const wildcard = Array.isArray(raw) ? raw.join('/') : typeof raw === 'string' ? raw : ''
-      const objectKey = wildcard.replace(/^\/+/, '')
-      if (!objectKey || objectKey.split('/').some((seg) => seg === '..')) {
-        return res.status(400).json({ error: 'Caminho inválido' })
-      }
-
-      const signedUrl = await createSignedUrlForStoredPath(`uploads/${objectKey}`)
-      if (!signedUrl) {
-        return res.status(404).json({ error: 'Arquivo não encontrado' })
-      }
-
-      return res.redirect(signedUrl)
-    } catch (error: any) {
-      return res.status(400).json({ error: error.message || 'Erro ao acessar arquivo' })
+// Express 5 / path-to-regexp requires a named wildcard param
+app.get('/uploads/*path', async (req, res, next) => {
+  try {
+    // In local mode, let express.static handle it.
+    if (getStorageProvider() !== 'supabase') {
+      return next()
     }
-  })
-}
+
+    const raw = (req.params as any).path as unknown
+    const wildcard = Array.isArray(raw) ? raw.join('/') : typeof raw === 'string' ? raw : ''
+    const objectKey = wildcard.replace(/^\/+/, '')
+    if (!objectKey || objectKey.split('/').some((seg) => seg === '..')) {
+      return res.status(400).json({ error: 'Caminho inválido' })
+    }
+
+    const signedUrl = await createSignedUrlForStoredPath(`uploads/${objectKey}`)
+    if (!signedUrl) {
+      return res.status(404).json({ error: 'Arquivo não encontrado' })
+    }
+
+    return res.redirect(signedUrl)
+  } catch (error: any) {
+    return res.status(400).json({ error: error.message || 'Erro ao acessar arquivo' })
+  }
+})
 
 app.use(
   '/uploads',

@@ -54,27 +54,29 @@ app.use('/api/form', form_routes_1.default);
 app.use('/api/report', report_routes_1.default);
 app.use('/api/pld', pldBuilder_routes_1.default);
 // Arquivos estáticos (uploads, evidências, relatórios)
-if ((0, storage_1.getStorageProvider)() === 'supabase') {
-    // Express 5 / path-to-regexp requires a named wildcard param
-    app.get('/uploads/*path', async (req, res) => {
-        try {
-            const raw = req.params.path;
-            const wildcard = Array.isArray(raw) ? raw.join('/') : typeof raw === 'string' ? raw : '';
-            const objectKey = wildcard.replace(/^\/+/, '');
-            if (!objectKey || objectKey.split('/').some((seg) => seg === '..')) {
-                return res.status(400).json({ error: 'Caminho inválido' });
-            }
-            const signedUrl = await (0, storage_1.createSignedUrlForStoredPath)(`uploads/${objectKey}`);
-            if (!signedUrl) {
-                return res.status(404).json({ error: 'Arquivo não encontrado' });
-            }
-            return res.redirect(signedUrl);
+// Express 5 / path-to-regexp requires a named wildcard param
+app.get('/uploads/*path', async (req, res, next) => {
+    try {
+        // In local mode, let express.static handle it.
+        if ((0, storage_1.getStorageProvider)() !== 'supabase') {
+            return next();
         }
-        catch (error) {
-            return res.status(400).json({ error: error.message || 'Erro ao acessar arquivo' });
+        const raw = req.params.path;
+        const wildcard = Array.isArray(raw) ? raw.join('/') : typeof raw === 'string' ? raw : '';
+        const objectKey = wildcard.replace(/^\/+/, '');
+        if (!objectKey || objectKey.split('/').some((seg) => seg === '..')) {
+            return res.status(400).json({ error: 'Caminho inválido' });
         }
-    });
-}
+        const signedUrl = await (0, storage_1.createSignedUrlForStoredPath)(`uploads/${objectKey}`);
+        if (!signedUrl) {
+            return res.status(404).json({ error: 'Arquivo não encontrado' });
+        }
+        return res.redirect(signedUrl);
+    }
+    catch (error) {
+        return res.status(400).json({ error: error.message || 'Erro ao acessar arquivo' });
+    }
+});
 app.use('/uploads', express_1.default.static((0, paths_1.getUploadsRoot)(), {
     index: false,
     dotfiles: 'deny',
