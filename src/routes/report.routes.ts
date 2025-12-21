@@ -7,6 +7,12 @@ import { createSignedUrlForStoredPath, getStorageProvider } from '../config/stor
 
 const router = express.Router()
 
+function buildPublicDownloadUrl(filePath: string): string {
+  const base = (process.env.PUBLIC_BASE_URL || '').replace(/\/+$/, '')
+  const normalized = `/${filePath.replace(/\\/g, '/').replace(/^\/+/, '')}`
+  return base ? `${base}${normalized}` : normalized
+}
+
 // Gera e retorna o relatório do usuário autenticado
 router.get('/me', authenticate, async (req, res) => {
   try {
@@ -31,9 +37,14 @@ router.get('/me', authenticate, async (req, res) => {
       return res.status(500).json({ error: 'Falha ao localizar arquivo de relatório' })
     }
 
+    const downloadUrl = buildPublicDownloadUrl(filePath)
+    const signedUrl = getStorageProvider() === 'supabase' ? await createSignedUrlForStoredPath(filePath) : null
+
     return res.json({
       report,
       url: `/${filePath.replace(/\\/g, '/')}`,
+      downloadUrl,
+      signedUrl,
     })
   } catch (error: any) {
     return res.status(400).json({ error: error.message || 'Erro ao gerar relatório' })
@@ -68,9 +79,14 @@ router.get('/user/:id', authenticate, async (req, res) => {
       return res.status(500).json({ error: 'Falha ao localizar arquivo de relatório' })
     }
 
+    const downloadUrl = buildPublicDownloadUrl(filePath)
+    const signedUrl = getStorageProvider() === 'supabase' ? await createSignedUrlForStoredPath(filePath) : null
+
     return res.json({
       report,
       url: `/${filePath.replace(/\\/g, '/')}`,
+      downloadUrl,
+      signedUrl,
     })
   } catch (error: any) {
     return res.status(400).json({ error: error.message || 'Erro ao gerar relatório do usuário' })
@@ -94,9 +110,14 @@ router.get('/pld-builder', authenticate, async (req, res) => {
       return res.status(500).json({ error: 'Falha ao localizar arquivo de relatório' })
     }
 
+    const downloadUrl = buildPublicDownloadUrl(filePath)
+    const signedUrl = getStorageProvider() === 'supabase' ? await createSignedUrlForStoredPath(filePath) : null
+
     return res.json({
       report,
       url: `/${filePath.replace(/\\/g, '/')}`,
+      downloadUrl,
+      signedUrl,
     })
   } catch (error: any) {
     return res.status(400).json({ error: error.message || 'Erro ao gerar relatório do builder' })

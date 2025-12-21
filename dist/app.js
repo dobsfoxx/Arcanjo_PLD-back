@@ -58,8 +58,9 @@ if ((0, storage_1.getStorageProvider)() === 'supabase') {
     // Express 5 / path-to-regexp requires a named wildcard param
     app.get('/uploads/*path', async (req, res) => {
         try {
-            const wildcard = req.params.path;
-            const objectKey = (wildcard || '').replace(/^\/+/, '');
+            const raw = req.params.path;
+            const wildcard = Array.isArray(raw) ? raw.join('/') : typeof raw === 'string' ? raw : '';
+            const objectKey = wildcard.replace(/^\/+/, '');
             if (!objectKey || objectKey.split('/').some((seg) => seg === '..')) {
                 return res.status(400).json({ error: 'Caminho inválido' });
             }

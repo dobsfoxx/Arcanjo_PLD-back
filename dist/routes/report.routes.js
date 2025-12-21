@@ -10,6 +10,11 @@ const reportServices_1 = require("../services/reportServices");
 const paths_1 = require("../config/paths");
 const storage_1 = require("../config/storage");
 const router = express_1.default.Router();
+function buildPublicDownloadUrl(filePath) {
+    const base = (process.env.PUBLIC_BASE_URL || '').replace(/\/+$/, '');
+    const normalized = `/${filePath.replace(/\\/g, '/').replace(/^\/+/, '')}`;
+    return base ? `${base}${normalized}` : normalized;
+}
 // Gera e retorna o relatório do usuário autenticado
 router.get('/me', auth_1.authenticate, async (req, res) => {
     try {
@@ -30,9 +35,13 @@ router.get('/me', auth_1.authenticate, async (req, res) => {
         if (!filePath) {
             return res.status(500).json({ error: 'Falha ao localizar arquivo de relatório' });
         }
+        const downloadUrl = buildPublicDownloadUrl(filePath);
+        const signedUrl = (0, storage_1.getStorageProvider)() === 'supabase' ? await (0, storage_1.createSignedUrlForStoredPath)(filePath) : null;
         return res.json({
             report,
             url: `/${filePath.replace(/\\/g, '/')}`,
+            downloadUrl,
+            signedUrl,
         });
     }
     catch (error) {
@@ -62,9 +71,13 @@ router.get('/user/:id', auth_1.authenticate, async (req, res) => {
         if (!filePath) {
             return res.status(500).json({ error: 'Falha ao localizar arquivo de relatório' });
         }
+        const downloadUrl = buildPublicDownloadUrl(filePath);
+        const signedUrl = (0, storage_1.getStorageProvider)() === 'supabase' ? await (0, storage_1.createSignedUrlForStoredPath)(filePath) : null;
         return res.json({
             report,
             url: `/${filePath.replace(/\\/g, '/')}`,
+            downloadUrl,
+            signedUrl,
         });
     }
     catch (error) {
@@ -84,9 +97,13 @@ router.get('/pld-builder', auth_1.authenticate, async (req, res) => {
         if (!filePath) {
             return res.status(500).json({ error: 'Falha ao localizar arquivo de relatório' });
         }
+        const downloadUrl = buildPublicDownloadUrl(filePath);
+        const signedUrl = (0, storage_1.getStorageProvider)() === 'supabase' ? await (0, storage_1.createSignedUrlForStoredPath)(filePath) : null;
         return res.json({
             report,
             url: `/${filePath.replace(/\\/g, '/')}`,
+            downloadUrl,
+            signedUrl,
         });
     }
     catch (error) {
