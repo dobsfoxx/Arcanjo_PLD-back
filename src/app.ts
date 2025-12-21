@@ -66,9 +66,10 @@ app.use('/api/pld', pldBuilderRoutes)
 
 // Arquivos estáticos (uploads, evidências, relatórios)
 if (getStorageProvider() === 'supabase') {
-  app.get('/uploads/*', async (req, res) => {
+  // Express 5 / path-to-regexp requires a named wildcard param
+  app.get('/uploads/*path', async (req, res) => {
     try {
-      const wildcard = (req.params as any)[0] as string | undefined
+      const wildcard = (req.params as any).path as string | undefined
       const objectKey = (wildcard || '').replace(/^\/+/, '')
       if (!objectKey || objectKey.split('/').some((seg) => seg === '..')) {
         return res.status(400).json({ error: 'Caminho inválido' })
