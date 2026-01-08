@@ -47,7 +47,7 @@ class FormService {
             },
             orderBy: { order: 'asc' },
         });
-        // Adaptar para o formato esperado pelo frontend: question.answer (única)
+        // Tópico e pergunta(usuario)
         const adapted = topics.map((topic) => ({
             ...topic,
             questions: topic.questions.map((question) => {
@@ -192,8 +192,8 @@ class FormService {
     justification, testOption, testDescription, correctiveActionPlan) {
         // Validações para o fluxo de teste
         if (testOption === 'SIM') {
-            if (testDescription && testDescription.length > 300) {
-                throw new Error('Descrição do teste deve ter até 300 caracteres');
+            if (testDescription && testDescription.length > 600) {
+                throw new Error('Descrição do teste deve ter até 600 caracteres');
             }
         }
         if (testOption === 'CORRETIVA') {
@@ -261,8 +261,8 @@ class FormService {
     // ADMIN: atualizar resposta de um usuário específico durante revisão
     static async adminUpdateAnswer(questionId, assigneeId, response, justification, deficiency, recommendation, testOption, testDescription, correctiveActionPlan) {
         if (testOption === 'SIM') {
-            if (testDescription && testDescription.length > 300) {
-                throw new Error('Descrição do teste deve ter até 300 caracteres');
+            if (testDescription && testDescription.length > 600) {
+                throw new Error('Descrição do teste deve ter até 600 caracteres');
             }
         }
         if (testOption === 'CORRETIVA') {

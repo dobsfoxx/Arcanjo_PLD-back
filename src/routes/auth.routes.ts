@@ -1,27 +1,55 @@
 import express from 'express'
 import { AuthService } from '../services/auth.service'
 import { authenticate, requireAdmin } from '../middleware/auth'
+import prisma from '../config/database'
 
 const router = express.Router()
 
+function setAuthCookie(res: express.Response, token: string) {
+  const isProd = process.env.NODE_ENV === 'production'
+  res.cookie('pld_token', token, {
+    httpOnly: true,
+    sameSite: 'lax',
+    secure: isProd,
+    path: '/',
+  })
+}
+
+function clearAuthCookie(res: express.Response) {
+  const isProd = process.env.NODE_ENV === 'production'
+  res.clearCookie('pld_token', {
+    httpOnly: true,
+    sameSite: 'lax',
+    secure: isProd,
+    path: '/',
+  })
+}
+
 router.post('/register', async (req, res) => {
   try {
-    const { name, email, password } = req.body
+    const { name, email, password, startTrial } = req.body
 
     if (!name || !email || !password) {
       return res.status(400).json({ error: 'Nome, e-mail e senha são obrigatórios' })
     }
 
-    const { user, token } = await AuthService.registerUser(name, email, password)
+    const { user, token } = await AuthService.registerUser(name, email, password, { startTrial: !!startTrial })
 
     const { password: _pw, ...safeUser } = user
 
+    setAuthCookie(res, token)
     res.status(201).json({
       token,
       user: safeUser,
     })
   } catch (error: any) {
-    res.status(400).json({ error: error.message || 'Erro ao registrar usuário' })
+    console.error('[AUTH] register failed:', error)
+    const msg = typeof error?.message === 'string' ? error.message : ''
+    const safeMessage =
+      msg === 'E-mail já está em uso' || msg === 'A senha deve ter pelo menos 8 caracteres'
+        ? msg
+        : 'Erro ao registrar usuário'
+    res.status(400).json({ error: safeMessage })
   }
 })
 
@@ -36,12 +64,16 @@ router.post('/login', async (req, res) => {
     const { user, token } = await AuthService.login(email, password)
     const { password: _pw, ...safeUser } = user
 
+    setAuthCookie(res, token)
     res.json({
       token,
       user: safeUser,
     })
   } catch (error: any) {
-    res.status(401).json({ error: error.message || 'Erro ao autenticar' })
+    console.error('[AUTH] login failed:', error)
+    const msg = typeof error?.message === 'string' ? error.message : ''
+    const safeMessage = msg === 'Credenciais inválidas' || msg === 'Usuário inativo' ? msg : 'Erro ao autenticar'
+    res.status(401).json({ error: safeMessage })
   }
 })
 
@@ -57,12 +89,19 @@ router.post('/bootstrap-admin', async (req, res) => {
     const { user, token } = await AuthService.bootstrapAdmin(name, email, password)
     const { password: _pw, ...safeUser } = user
 
+    setAuthCookie(res, token)
     res.status(201).json({
       token,
       user: safeUser,
     })
   } catch (error: any) {
-    res.status(400).json({ error: error.message || 'Erro ao criar administrador' })
+    console.error('[AUTH] bootstrap-admin failed:', error)
+    const msg = typeof error?.message === 'string' ? error.message : ''
+    const safeMessage =
+      msg === 'Já existe um administrador cadastrado' || msg === 'Senha do administrador deve ter pelo menos 10 caracteres'
+        ? msg
+        : 'Erro ao criar administrador'
+    res.status(400).json({ error: safeMessage })
   }
 })
 
@@ -80,7 +119,8 @@ router.post('/forgot-password', async (req, res) => {
     // Sempre responder sucesso para não expor se o e-mail existe ou não
     res.json({ message: 'Se existir uma conta com este e-mail, enviaremos instruções de recuperação.' })
   } catch (error: any) {
-    res.status(500).json({ error: error.message || 'Erro ao solicitar recuperação de senha' })
+    console.error('[AUTH] forgot-password failed:', error)
+    res.status(500).json({ error: 'Erro ao solicitar recuperação de senha' })
   }
 })
 
@@ -96,8 +136,59 @@ router.post('/reset-password', async (req, res) => {
     await AuthService.resetPassword(token, password)
     res.json({ message: 'Senha redefinida com sucesso. Você já pode fazer login com a nova senha.' })
   } catch (error: any) {
-    res.status(400).json({ error: error.message || 'Erro ao redefinir senha' })
+    console.error('[AUTH] reset-password failed:', error)
+    const msg = typeof error?.message === 'string' ? error.message : ''
+    const safeMessage =
+      msg === 'A nova senha deve ter pelo menos 8 caracteres' || msg === 'Token de recuperação inválido ou expirado'
+        ? msg
+        : 'Erro ao redefinir senha'
+    res.status(400).json({ error: safeMessage })
   }
+})
+
+// Login com Google OAuth
+router.post('/google', async (req, res) => {
+  try {
+    const { credential } = req.body
+
+    if (!credential) {
+      return res.status(400).json({ error: 'Credential do Google é obrigatório' })
+    }
+
+    // Decodifica o JWT do Google (em produção, você deve verificar a assinatura)
+    // O credential é um JWT que contém as informações do usuário
+    const base64Payload = credential.split('.')[1]
+    const payload = JSON.parse(Buffer.from(base64Payload, 'base64').toString('utf-8'))
+
+    const { email, name, picture, email_verified } = payload
+
+    if (!email_verified) {
+      return res.status(400).json({ error: 'E-mail do Google não verificado' })
+    }
+
+    const { user, token } = await AuthService.loginWithGoogleProfile({
+      email,
+      name,
+      picture,
+      email_verified,
+    })
+
+    const { password: _pw, ...safeUser } = user
+
+    setAuthCookie(res, token)
+    res.json({
+      token,
+      user: safeUser,
+    })
+  } catch (error: any) {
+    console.error('[AUTH] google failed:', error)
+    res.status(401).json({ error: 'Erro ao autenticar com Google' })
+  }
+})
+
+router.post('/logout', authenticate, (req, res) => {
+  clearAuthCookie(res)
+  return res.json({ message: 'Logout realizado com sucesso' })
 })
 
 // Exemplo de rota protegida para verificar sessão
@@ -108,6 +199,36 @@ router.get('/me', authenticate, (req, res) => {
 
   const { password: _pw, ...safeUser } = req.user
   return res.json({ user: safeUser })
+})
+
+router.patch('/me', authenticate, async (req, res) => {
+  try {
+    if (!req.user) {
+      return res.status(401).json({ error: 'Não autenticado' })
+    }
+
+    const rawName = (req.body?.name as unknown) ?? ''
+    const name = typeof rawName === 'string' ? rawName.trim() : ''
+
+    if (!name) {
+      return res.status(400).json({ error: 'Nome é obrigatório' })
+    }
+
+    if (name.length < 2 || name.length > 80) {
+      return res.status(400).json({ error: 'Nome deve ter entre 2 e 80 caracteres' })
+    }
+
+    const updated = await prisma.user.update({
+      where: { id: req.user.id },
+      data: { name },
+    })
+
+    const { password: _pw, ...safeUser } = updated
+    return res.json({ user: safeUser })
+  } catch (error) {
+    console.error('[AUTH] patch /me failed:', error)
+    return res.status(500).json({ error: 'Erro ao atualizar perfil' })
+  }
 })
 
 // Exemplo de rota apenas para admin

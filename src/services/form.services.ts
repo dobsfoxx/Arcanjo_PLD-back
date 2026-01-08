@@ -53,7 +53,7 @@ export class FormService {
       orderBy: { order: 'asc' },
     })
 
-    // Adaptar para o formato esperado pelo frontend: question.answer (única)
+    // Tópico e pergunta(usuario)
     const adapted = (topics as any[]).map((topic: any) => ({
       ...topic,
       questions: (topic.questions as any[]).map((question: any) => {
@@ -245,8 +245,8 @@ export class FormService {
   ) {
     // Validações para o fluxo de teste
     if (testOption === 'SIM') {
-      if (testDescription && testDescription.length > 300) {
-        throw new Error('Descrição do teste deve ter até 300 caracteres')
+      if (testDescription && testDescription.length > 600) {
+        throw new Error('Descrição do teste deve ter até 600 caracteres')
       }
     }
 
@@ -331,8 +331,8 @@ export class FormService {
     correctiveActionPlan?: string,
   ) {
     if (testOption === 'SIM') {
-      if (testDescription && testDescription.length > 300) {
-        throw new Error('Descrição do teste deve ter até 300 caracteres')
+      if (testDescription && testDescription.length > 600) {
+        throw new Error('Descrição do teste deve ter até 600 caracteres')
       }
     }
 

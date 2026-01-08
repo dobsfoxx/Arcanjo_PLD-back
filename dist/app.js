@@ -8,8 +8,15 @@ const cors_1 = __importDefault(require("cors"));
 const helmet_1 = __importDefault(require("helmet"));
 const morgan_1 = __importDefault(require("morgan"));
 const dotenv_1 = require("dotenv");
+const path_1 = __importDefault(require("path"));
+const multer_1 = __importDefault(require("multer"));
+const fs_1 = __importDefault(require("fs"));
+const cookie_parser_1 = __importDefault(require("cookie-parser"));
 const paths_1 = require("./config/paths");
 const storage_1 = require("./config/storage");
+const auth_1 = require("./middleware/auth");
+const billing_webhook_1 = require("./routes/billing.webhook");
+const publicError_1 = require("./utils/publicError");
 (0, dotenv_1.config)();
 const app = (0, express_1.default)();
 // Segurança básica
@@ -22,6 +29,7 @@ const corsAllowlist = (process.env.CORS_ORIGIN || '')
     .map((o) => o.trim())
     .filter(Boolean);
 app.use((0, cors_1.default)({
+    credentials: true,
     origin: (origin, cb) => {
         // Permitir requests sem Origin (curl, Postman, server-to-server)
         if (!origin)
@@ -33,12 +41,15 @@ app.use((0, cors_1.default)({
         }
         return cb(null, corsAllowlist.includes(origin));
     },
-    credentials: true,
 }));
 // Logs de requisição
 app.use((0, morgan_1.default)('combined'));
+// Stripe webhook precisa do corpo "raw" (não JSON parseado)
+app.post('/api/billing/webhook', express_1.default.raw({ type: 'application/json' }), billing_webhook_1.billingWebhookHandler);
 // Body parser
 app.use(express_1.default.json({ limit: '10mb' }));
+// Cookies (para auth via HttpOnly cookie)
+app.use((0, cookie_parser_1.default)());
 // Test route
 app.get('/', (req, res) => {
     res.json({ message: 'Formulário PLD API' });
@@ -50,37 +61,62 @@ app.use('/api/auth', auth_routes_1.default);
 const form_routes_1 = __importDefault(require("./routes/form.routes"));
 const report_routes_1 = __importDefault(require("./routes/report.routes"));
 const pldBuilder_routes_1 = __importDefault(require("./routes/pldBuilder.routes"));
+const billing_routes_1 = __importDefault(require("./routes/billing.routes"));
 app.use('/api/form', form_routes_1.default);
 app.use('/api/report', report_routes_1.default);
 app.use('/api/pld', pldBuilder_routes_1.default);
+app.use('/api/billing', billing_routes_1.default);
 // Arquivos estáticos (uploads, evidências, relatórios)
 // Express 5 / path-to-regexp requires a named wildcard param
-app.get('/uploads/*path', async (req, res, next) => {
+app.get('/uploads/*path', auth_1.authenticateFromHeaderOrQuery, async (req, res) => {
     try {
-        // In local mode, let express.static handle it.
-        if ((0, storage_1.getStorageProvider)() !== 'supabase') {
-            return next();
-        }
         const raw = req.params.path;
         const wildcard = Array.isArray(raw) ? raw.join('/') : typeof raw === 'string' ? raw : '';
         const objectKey = wildcard.replace(/^\/+/, '');
         if (!objectKey || objectKey.split('/').some((seg) => seg === '..')) {
             return res.status(400).json({ error: 'Caminho inválido' });
         }
-        const signedUrl = await (0, storage_1.createSignedUrlForStoredPath)(`uploads/${objectKey}`);
-        if (!signedUrl) {
+        if ((0, storage_1.getStorageProvider)() === 'supabase') {
+            const signedUrl = await (0, storage_1.createSignedUrlForStoredPath)(`uploads/${objectKey}`);
+            if (!signedUrl) {
+                return res.status(404).json({ error: 'Arquivo não encontrado' });
+            }
+            return res.redirect(signedUrl);
+        }
+        const absolutePath = path_1.default.join((0, paths_1.getUploadsRoot)(), objectKey);
+        const uploadsRoot = (0, paths_1.getUploadsRoot)();
+        const normalizedRoot = path_1.default.resolve(uploadsRoot);
+        const normalizedTarget = path_1.default.resolve(absolutePath);
+        if (!normalizedTarget.startsWith(normalizedRoot + path_1.default.sep) && normalizedTarget !== normalizedRoot) {
+            return res.status(400).json({ error: 'Caminho inválido' });
+        }
+        if (!fs_1.default.existsSync(normalizedTarget)) {
             return res.status(404).json({ error: 'Arquivo não encontrado' });
         }
-        return res.redirect(signedUrl);
+        return res.sendFile(normalizedTarget);
     }
     catch (error) {
         return res.status(400).json({ error: error.message || 'Erro ao acessar arquivo' });
     }
 });
-app.use('/uploads', express_1.default.static((0, paths_1.getUploadsRoot)(), {
-    index: false,
-    dotfiles: 'deny',
-}));
+// Error handler (keeps responses JSON, including Multer errors like "too many files").
+app.use((err, _req, res, _next) => {
+    if (err instanceof multer_1.default.MulterError) {
+        if (err.code === 'LIMIT_UNEXPECTED_FILE') {
+            return res.status(400).json({ error: 'Limite de arquivos excedido (máximo 5).' });
+        }
+        if (err.code === 'LIMIT_FILE_SIZE') {
+            return res.status(400).json({ error: 'Arquivo excede o tamanho máximo permitido.' });
+        }
+        return res.status(400).json({ error: err.message });
+    }
+    if (process.env.NODE_ENV !== 'test') {
+        // Keep full details in server logs only.
+        // eslint-disable-next-line no-console
+        console.error('Unhandled error:', err);
+    }
+    return res.status(500).json({ error: (0, publicError_1.toPublicErrorMessage)(err, 'Erro inesperado') });
+});
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
     console.log(`🚀 Servidor de formulário rodando: http://localhost:${PORT}`);

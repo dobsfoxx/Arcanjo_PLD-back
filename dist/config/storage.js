@@ -14,7 +14,9 @@ const fs_1 = __importDefault(require("fs"));
 const path_1 = __importDefault(require("path"));
 const supabase_js_1 = require("@supabase/supabase-js");
 const paths_1 = require("./paths");
-const provider = (process.env.STORAGE_PROVIDER || '').toLowerCase() === 'supabase' ? 'supabase' : 'local';
+const providerRaw = (process.env.STORAGE_PROVIDER || '').trim().toLowerCase();
+const provider = providerRaw === 'supabase' ? 'supabase' : 'local';
+const debug = (process.env.STORAGE_DEBUG || '').trim().toLowerCase() === 'true';
 const bucket = (process.env.SUPABASE_STORAGE_BUCKET || 'uploads').trim();
 const defaultSignedUrlExpiresIn = Number(process.env.SUPABASE_SIGNED_URL_EXPIRES_IN || '3600');
 let supabaseClient = null;
@@ -70,12 +72,18 @@ async function uploadFileToStorage(params) {
     }
     const client = getSupabase();
     const fileBuffer = fs_1.default.readFileSync(localPath);
+    if (debug) {
+        console.log(`[storage] uploading to supabase bucket=${bucket} key=${objectKey} bytes=${fileBuffer.length}`);
+    }
     const uploadRes = await client.storage.from(bucket).upload(objectKey, fileBuffer, {
         contentType: contentType || 'application/octet-stream',
         upsert: true,
     });
     if (uploadRes.error) {
         throw new Error(`Supabase upload failed: ${uploadRes.error.message}`);
+    }
+    if (debug) {
+        console.log(`[storage] upload ok bucket=${bucket} key=${objectKey}`);
     }
     if (deleteLocal) {
         try {
@@ -101,6 +109,9 @@ async function createSignedUrlForStoredPath(storedPath, expiresInSeconds = defau
     const res = await client.storage.from(bucket).createSignedUrl(key, expiresInSeconds);
     if (res.error) {
         throw new Error(`Supabase signed URL failed: ${res.error.message}`);
+    }
+    if (debug) {
+        console.log(`[storage] signed url ok bucket=${bucket} key=${key} exp=${expiresInSeconds}`);
     }
     return res.data.signedUrl;
 }

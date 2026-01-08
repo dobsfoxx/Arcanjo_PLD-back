@@ -14,7 +14,44 @@ const crypto_1 = __importDefault(require("crypto"));
 const { EmailService } = require('./email.service');
 const SALT_ROUNDS = 10;
 class AuthService {
-    static async registerUser(name, email, password) {
+    /**
+     * Autentica/registra usuário via Google OAuth.
+     * Se o usuário já existe (pelo email), faz login.
+     * Se não existe, cria uma nova conta.
+     */
+    static async loginWithGoogleProfile(profile) {
+        const { email, name, picture } = profile;
+        if (!email) {
+            throw new Error('E-mail não fornecido pelo Google');
+        }
+        // Verifica se usuário já existe
+        let user = await database_1.default.user.findUnique({ where: { email } });
+        if (user) {
+            // Usuário existente - verificar se está ativo
+            if (!user.isActive) {
+                throw new Error('Usuário inativo');
+            }
+        }
+        else {
+            // Novo usuário - criar conta
+            // Gera uma senha aleatória (não será usada para login via Google)
+            const randomPassword = crypto_1.default.randomBytes(32).toString('hex');
+            const hashedPassword = await bcryptjs_1.default.hash(randomPassword, SALT_ROUNDS);
+            user = await database_1.default.user.create({
+                data: {
+                    name: name || email.split('@')[0],
+                    email,
+                    password: hashedPassword,
+                    role: 'USER',
+                    isTrial: false,
+                    trialExpiresAt: null,
+                },
+            });
+        }
+        const token = (0, auth_1.signToken)(user.id);
+        return { user, token };
+    }
+    static async registerUser(name, email, password, opts) {
         const existing = await database_1.default.user.findUnique({ where: { email } });
         if (existing) {
             throw new Error('E-mail já está em uso');
@@ -23,12 +60,16 @@ class AuthService {
             throw new Error('A senha deve ter pelo menos 8 caracteres');
         }
         const hashedPassword = await bcryptjs_1.default.hash(password, SALT_ROUNDS);
+        const startTrial = !!opts?.startTrial;
+        const trialExpiresAt = startTrial ? new Date(Date.now() + 3 * 24 * 60 * 60 * 1000) : null;
         const user = await database_1.default.user.create({
             data: {
                 name,
                 email,
                 password: hashedPassword,
-                role: 'USER',
+                role: startTrial ? 'TRIAL_ADMIN' : 'USER',
+                isTrial: startTrial,
+                trialExpiresAt,
             },
         });
         const token = (0, auth_1.signToken)(user.id);
@@ -45,6 +86,15 @@ class AuthService {
         }
         if (!user.isActive) {
             throw new Error('Usuário inativo');
+        }
+        // Se o trial expirou, rebaixa imediatamente para USER.
+        if (user.role === 'TRIAL_ADMIN' && user.isTrial && user.trialExpiresAt && user.trialExpiresAt.getTime() <= Date.now()) {
+            const downgraded = await database_1.default.user.update({
+                where: { id: user.id },
+                data: { role: 'USER', isTrial: false, trialExpiresAt: null },
+            });
+            const token = (0, auth_1.signToken)(downgraded.id);
+            return { user: downgraded, token };
         }
         const token = (0, auth_1.signToken)(user.id);
         return { user, token };

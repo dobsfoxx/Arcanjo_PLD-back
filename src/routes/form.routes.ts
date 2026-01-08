@@ -5,13 +5,21 @@ import { upload, uploadMultiple } from '../config/upload'
 import fs from 'fs'
 import prisma from '../config/database'
 import { authenticate, requireAdmin } from '../middleware/auth'
+import { validateBody } from '../middleware/validate'
 import { getUploadsRoot, resolveFromUploads, stripUploadsPrefix } from '../config/paths'
 import { getStorageProvider, uploadFileToStorage, createSignedUrlForStoredPath } from '../config/storage'
+import {
+  adminUpdateAnswerSchema,
+  answerQuestionSchema,
+  createFormQuestionSchema,
+  createTopicSchema,
+  updateFormQuestionSchema,
+} from '../validators/form.schemas'
 
 const router = express.Router()
 
 // =========== TÓPICOS ===========
-router.post('/topics', authenticate, requireAdmin, async (req, res) => {
+router.post('/topics', authenticate, requireAdmin, validateBody(createTopicSchema), async (req, res) => {
   try {
     const { name, description, internalNorm } = req.body
     const userId = req.user!.id
@@ -181,7 +189,7 @@ router.delete('/uploads/clean', authenticate, requireAdmin, async (_req, res) =>
 })
 
 // =========== PERGUNTAS ===========
-router.post('/questions', authenticate, requireAdmin, async (req, res) => {
+router.post('/questions', authenticate, requireAdmin, validateBody(createFormQuestionSchema), async (req, res) => {
   try {
     const { topicId, title, description, criticality, capitulation } = req.body
     const question = await FormService.createQuestion(topicId, title, description, criticality, capitulation)
@@ -325,7 +333,7 @@ router.delete('/questions/:id', authenticate, requireAdmin, async (req, res) => 
 });
 
 // Atualizar pergunta
-router.put('/questions/:id', authenticate, requireAdmin, async (req, res) => {
+router.put('/questions/:id', authenticate, requireAdmin, validateBody(updateFormQuestionSchema), async (req, res) => {
   try {
     const { id } = req.params;
     const data = req.body;
@@ -427,7 +435,7 @@ router.post('/answers/:answerId/evidences', authenticate, uploadMultiple, async 
 });
 
 // =========== RESPOSTAS ===========
-router.post('/answers', authenticate, async (req, res) => {
+router.post('/answers', authenticate, validateBody(answerQuestionSchema), async (req, res) => {
   try {
     const { questionId, response, justification, testOption, testDescription, correctiveActionPlan } = req.body
     const userId = req.user!.id
@@ -449,7 +457,7 @@ router.post('/answers', authenticate, async (req, res) => {
 })
 
 // ADMIN: atualizar resposta de um usuário específico durante a revisão
-router.post('/admin/answers', authenticate, requireAdmin, async (req, res) => {
+router.post('/admin/answers', authenticate, requireAdmin, validateBody(adminUpdateAnswerSchema), async (req, res) => {
   try {
     const { questionId, assigneeId, response, justification, deficiency, recommendation, testOption, testDescription, correctiveActionPlan } = req.body
     const answer = await FormService.adminUpdateAnswer(

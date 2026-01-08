@@ -10,11 +10,13 @@ const upload_1 = require("../config/upload");
 const fs_1 = __importDefault(require("fs"));
 const database_1 = __importDefault(require("../config/database"));
 const auth_1 = require("../middleware/auth");
+const validate_1 = require("../middleware/validate");
 const paths_1 = require("../config/paths");
 const storage_1 = require("../config/storage");
+const form_schemas_1 = require("../validators/form.schemas");
 const router = express_1.default.Router();
 // =========== TÓPICOS ===========
-router.post('/topics', auth_1.authenticate, auth_1.requireAdmin, async (req, res) => {
+router.post('/topics', auth_1.authenticate, auth_1.requireAdmin, (0, validate_1.validateBody)(form_schemas_1.createTopicSchema), async (req, res) => {
     try {
         const { name, description, internalNorm } = req.body;
         const userId = req.user.id;
@@ -171,7 +173,7 @@ router.delete('/uploads/clean', auth_1.authenticate, auth_1.requireAdmin, async 
     }
 });
 // =========== PERGUNTAS ===========
-router.post('/questions', auth_1.authenticate, auth_1.requireAdmin, async (req, res) => {
+router.post('/questions', auth_1.authenticate, auth_1.requireAdmin, (0, validate_1.validateBody)(form_schemas_1.createFormQuestionSchema), async (req, res) => {
     try {
         const { topicId, title, description, criticality, capitulation } = req.body;
         const question = await form_services_1.FormService.createQuestion(topicId, title, description, criticality, capitulation);
@@ -303,7 +305,7 @@ router.delete('/questions/:id', auth_1.authenticate, auth_1.requireAdmin, async 
     }
 });
 // Atualizar pergunta
-router.put('/questions/:id', auth_1.authenticate, auth_1.requireAdmin, async (req, res) => {
+router.put('/questions/:id', auth_1.authenticate, auth_1.requireAdmin, (0, validate_1.validateBody)(form_schemas_1.updateFormQuestionSchema), async (req, res) => {
     try {
         const { id } = req.params;
         const data = req.body;
@@ -393,7 +395,7 @@ router.post('/answers/:answerId/evidences', auth_1.authenticate, upload_1.upload
     }
 });
 // =========== RESPOSTAS ===========
-router.post('/answers', auth_1.authenticate, async (req, res) => {
+router.post('/answers', auth_1.authenticate, (0, validate_1.validateBody)(form_schemas_1.answerQuestionSchema), async (req, res) => {
     try {
         const { questionId, response, justification, testOption, testDescription, correctiveActionPlan } = req.body;
         const userId = req.user.id;
@@ -405,7 +407,7 @@ router.post('/answers', auth_1.authenticate, async (req, res) => {
     }
 });
 // ADMIN: atualizar resposta de um usuário específico durante a revisão
-router.post('/admin/answers', auth_1.authenticate, auth_1.requireAdmin, async (req, res) => {
+router.post('/admin/answers', auth_1.authenticate, auth_1.requireAdmin, (0, validate_1.validateBody)(form_schemas_1.adminUpdateAnswerSchema), async (req, res) => {
     try {
         const { questionId, assigneeId, response, justification, deficiency, recommendation, testOption, testDescription, correctiveActionPlan } = req.body;
         const answer = await form_services_1.FormService.adminUpdateAnswer(questionId, assigneeId, response, justification, deficiency, recommendation, testOption, testDescription, correctiveActionPlan);

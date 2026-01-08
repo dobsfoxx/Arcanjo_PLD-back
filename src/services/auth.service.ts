@@ -9,8 +9,63 @@ const { EmailService } = require('./email.service') as any
 
 const SALT_ROUNDS = 10
 
+interface GoogleUserProfile {
+  email: string;
+  name: string;
+  picture?: string;
+  email_verified?: boolean;
+}
+
 export class AuthService {
-  static async registerUser(name: string, email: string, password: string) {
+  /**
+   * Autentica/registra usuário via Google OAuth.
+   * Se o usuário já existe (pelo email), faz login.
+   * Se não existe, cria uma nova conta.
+   */
+  static async loginWithGoogleProfile(profile: GoogleUserProfile) {
+    const { email, name, picture } = profile;
+
+    if (!email) {
+      throw new Error('E-mail não fornecido pelo Google');
+    }
+
+    // Verifica se usuário já existe
+    let user = await prisma.user.findUnique({ where: { email } });
+
+    if (user) {
+      // Usuário existente - verificar se está ativo
+      if (!user.isActive) {
+        throw new Error('Usuário inativo');
+      }
+    } else {
+      // Novo usuário - criar conta
+      // Gera uma senha aleatória (não será usada para login via Google)
+      const randomPassword = crypto.randomBytes(32).toString('hex');
+      const hashedPassword = await bcrypt.hash(randomPassword, SALT_ROUNDS);
+
+      user = await prisma.user.create({
+        data: {
+          name: name || email.split('@')[0],
+          email,
+          password: hashedPassword,
+          role: 'USER',
+          isTrial: false,
+          trialExpiresAt: null,
+        },
+      });
+    }
+
+    const token = signToken(user.id);
+
+    return { user, token };
+  }
+
+  static async registerUser(
+    name: string,
+    email: string,
+    password: string,
+    opts?: { startTrial?: boolean }
+  ) {
     const existing = await prisma.user.findUnique({ where: { email } })
 
     if (existing) {
@@ -23,12 +78,17 @@ export class AuthService {
 
     const hashedPassword = await bcrypt.hash(password, SALT_ROUNDS)
 
+    const startTrial = !!opts?.startTrial
+    const trialExpiresAt = startTrial ? new Date(Date.now() + 3 * 24 * 60 * 60 * 1000) : null
+
     const user = await prisma.user.create({
       data: {
         name,
         email,
         password: hashedPassword,
-        role: 'USER',
+        role: startTrial ? 'TRIAL_ADMIN' : 'USER',
+        isTrial: startTrial,
+        trialExpiresAt,
       },
     })
 
@@ -52,6 +112,16 @@ export class AuthService {
 
     if (!user.isActive) {
       throw new Error('Usuário inativo')
+    }
+
+    // Se o trial expirou, rebaixa imediatamente para USER.
+    if (user.role === 'TRIAL_ADMIN' && user.isTrial && user.trialExpiresAt && user.trialExpiresAt.getTime() <= Date.now()) {
+      const downgraded = await prisma.user.update({
+        where: { id: user.id },
+        data: { role: 'USER', isTrial: false, trialExpiresAt: null },
+      })
+      const token = signToken(downgraded.id)
+      return { user: downgraded, token }
     }
 
     const token = signToken(user.id)

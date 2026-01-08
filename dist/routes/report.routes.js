@@ -92,7 +92,65 @@ router.get('/pld-builder', auth_1.authenticate, async (req, res) => {
         }
         const formatParam = req.query.format?.toUpperCase();
         const format = formatParam === 'PDF' ? 'PDF' : 'DOCX';
-        const report = await reportServices_1.ReportService.generatePldBuilderReport(req.user.id, format);
+        const report = await reportServices_1.ReportService.generatePldBuilderReport(req.user.id, format, { name: null, metadata: null });
+        const filePath = report.filePath;
+        if (!filePath) {
+            return res.status(500).json({ error: 'Falha ao localizar arquivo de relatório' });
+        }
+        const downloadUrl = buildPublicDownloadUrl(filePath);
+        const signedUrl = (0, storage_1.getStorageProvider)() === 'supabase' ? await (0, storage_1.createSignedUrlForStoredPath)(filePath) : null;
+        return res.json({
+            report,
+            url: `/${filePath.replace(/\\/g, '/')}`,
+            downloadUrl,
+            signedUrl,
+        });
+    }
+    catch (error) {
+        return res.status(400).json({ error: error.message || 'Erro ao gerar relatório do builder' });
+    }
+});
+// USER (ou ADMIN): gera relatório baseado no formulário atual do novo PLD Builder (por formId)
+router.get('/forms/:id', auth_1.authenticate, async (req, res) => {
+    try {
+        const { id } = req.params;
+        const formatParam = req.query.format?.toUpperCase();
+        const format = formatParam === 'DOCX' ? 'DOCX' : 'PDF';
+        const report = await reportServices_1.ReportService.generatePldUserFormReport(id, {
+            requesterId: req.user.id,
+            requesterRole: req.user.role,
+            requesterEmail: req.user.email,
+        }, format);
+        const filePath = report.filePath;
+        if (!filePath) {
+            return res.status(500).json({ error: 'Falha ao localizar arquivo de relatório' });
+        }
+        const downloadUrl = buildPublicDownloadUrl(filePath);
+        const signedUrl = (0, storage_1.getStorageProvider)() === 'supabase' ? await (0, storage_1.createSignedUrlForStoredPath)(filePath) : null;
+        return res.json({
+            report,
+            url: `/${filePath.replace(/\\/g, '/')}`,
+            downloadUrl,
+            signedUrl,
+        });
+    }
+    catch (error) {
+        return res.status(400).json({ error: error.message || 'Erro ao gerar relatório do formulário' });
+    }
+});
+// ADMIN: gera relatório do builder com metadados de introdução (não persiste o formulário)
+router.post('/pld-builder', auth_1.authenticate, async (req, res) => {
+    try {
+        if (req.user.role !== 'ADMIN') {
+            return res.status(403).json({ error: 'Acesso negado' });
+        }
+        const formatParam = req.query.format?.toUpperCase();
+        const format = formatParam === 'PDF' ? 'PDF' : 'DOCX';
+        const { name, metadata } = (req.body ?? {});
+        const report = await reportServices_1.ReportService.generatePldBuilderReport(req.user.id, format, {
+            name: typeof name === 'string' ? name : null,
+            metadata: metadata ?? null,
+        });
         const filePath = report.filePath;
         if (!filePath) {
             return res.status(500).json({ error: 'Falha ao localizar arquivo de relatório' });

@@ -60,4 +60,4 @@ exports.upload = (0, multer_1.default)({
     fileFilter
 });
 // Middleware para múltiplos arquivos
-exports.uploadMultiple = exports.upload.array('files', 10); // Máximo 10 arquivos
+exports.uploadMultiple = exports.upload.array('files', 5); // Máximo 5 arquivos

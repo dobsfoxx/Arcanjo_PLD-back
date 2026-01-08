@@ -28,8 +28,12 @@ model User {
   email          String    @unique
   password       String
   name           String
-  isTrial        Boolean   @default(true)
+  isTrial        Boolean   @default(false)
   trialExpiresAt DateTime?
+  subscriptionStatus String @default("NONE")
+  subscriptionExpiresAt DateTime?
+  stripeCustomerId String? @unique
+  stripeSubscriptionId String? @unique
   isActive       Boolean   @default(true)
   role           String    @default("USER")
   createdAt      DateTime  @default(now())
@@ -42,6 +46,7 @@ model User {
 
   answers             Answer[]
   reports             Report[]
+  assignedReports     Report[] @relation("ReportAssignedTo")
   passwordResetTokens PasswordResetToken[]
   createdPldSections   PldSection[]       @relation("PldSectionCreatedBy")
 
@@ -54,6 +59,16 @@ enum WorkflowStatus {
   IN_PROGRESS
   SUBMITTED
   IN_REVIEW
+  RETURNED
+  COMPLETED
+}
+
+enum FormStatus {
+  DRAFT
+  SENT_TO_USER
+  IN_PROGRESS
+  SENT_FOR_REVIEW
+  APPROVED
   RETURNED
   COMPLETED
 }
@@ -153,9 +168,16 @@ model Report {
   content   String?
   filePath  String?
   userId    String
+  status    FormStatus? @default(DRAFT)
+  assignedToId String?
+  assignedToEmail String?
+  sentAt       DateTime?
+  submittedAt  DateTime?
+  reviewedAt   DateTime?
   createdAt DateTime @default(now())
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  assignedTo User? @relation("ReportAssignedTo", fields: [assignedToId], references: [id], onDelete: SetNull)
 
   @@map("reports")
 }

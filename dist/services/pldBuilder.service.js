@@ -5,6 +5,7 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.PldBuilderService = exports.ATTACHMENT_CATEGORIES = void 0;
 const database_1 = __importDefault(require("../config/database"));
+const fs_1 = __importDefault(require("fs"));
 const path_1 = __importDefault(require("path"));
 const paths_1 = require("../config/paths");
 const storage_1 = require("../config/storage");
@@ -22,6 +23,20 @@ exports.ATTACHMENT_CATEGORIES = {
 // even after `prisma generate`. Casting here avoids blocking editor diagnostics while
 // keeping runtime behavior intact.
 const prismaAny = database_1.default;
+const isTrialActive = (actor) => {
+    if (!actor.isTrial)
+        return false;
+    if (!actor.trialExpiresAt)
+        return false;
+    return actor.trialExpiresAt.getTime() > Date.now();
+};
+const hasActiveSubscription = (actor) => {
+    if ((actor.subscriptionStatus || '').toUpperCase() !== 'ACTIVE')
+        return false;
+    if (!actor.subscriptionExpiresAt)
+        return true;
+    return actor.subscriptionExpiresAt.getTime() > Date.now();
+};
 const coerceDateTime = (value) => {
     if (value === null || value === undefined)
         return value;
@@ -38,8 +53,117 @@ const coerceDateTime = (value) => {
     return parsed.toISOString();
 };
 class PldBuilderService {
-    static async listSections() {
+    static ensureBuilderAccess(actor) {
+        if (actor.role === 'ADMIN')
+            return;
+        if (actor.role === 'TRIAL_ADMIN') {
+            if (!isTrialActive(actor)) {
+                throw new Error('Seu período de teste expirou. Finalize o pagamento para continuar.');
+            }
+            return;
+        }
+        if (hasActiveSubscription(actor))
+            return;
+        throw new Error('Acesso ao builder restrito. Faça upgrade para continuar.');
+    }
+    static getScopeWhere(actor) {
+        // O builder é multi-tenant via `createdById`.
+        // Para ADMIN, usamos o escopo `createdById = null` (seções criadas por admin).
+        // Isso evita listar/limpar dados de outros usuários (TRIAL/assinantes).
+        if (actor.role !== 'ADMIN')
+            return { createdById: actor.id };
+        return { createdById: null };
+    }
+    static async assertSectionWritable(tx, actor, sectionId) {
+        if (actor.role === 'ADMIN')
+            return;
+        const section = await tx.pldSection.findUnique({ where: { id: sectionId }, select: { id: true, createdById: true } });
+        if (!section)
+            throw new Error('Seção não encontrada');
+        if (section.createdById !== actor.id)
+            throw new Error('Você não tem permissão para editar esta seção');
+    }
+    static async assertQuestionWritable(tx, actor, questionId) {
+        if (actor.role === 'ADMIN')
+            return;
+        const q = await tx.pldQuestion.findUnique({
+            where: { id: questionId },
+            select: { id: true, section: { select: { createdById: true } } },
+        });
+        if (!q)
+            throw new Error('Pergunta não encontrada');
+        if (q.section?.createdById !== actor.id)
+            throw new Error('Você não tem permissão para editar esta pergunta');
+    }
+    static bestEffortDeleteLocalUpload(publicPath) {
+        if (!publicPath)
+            return;
+        // publicPath is stored like `uploads/<relative>`.
+        const relative = publicPath.replace(/^\/+/g, '').replace(/^uploads\//, '');
+        if (!relative)
+            return;
+        const full = path_1.default.join((0, paths_1.getUploadsRoot)(), relative);
+        try {
+            if (fs_1.default.existsSync(full)) {
+                fs_1.default.unlinkSync(full);
+            }
+        }
+        catch {
+            // best effort only
+        }
+    }
+    static async ensureCapacityForBuilderAttachment(params) {
+        const existingCount = await prismaAny.pldAttachment.count({
+            where: {
+                category: params.category,
+                sectionId: params.sectionId ?? undefined,
+                questionId: params.questionId ?? undefined,
+            },
+        });
+        if (existingCount < 5)
+            return;
+        // Remove oldest to make room (keeps max 5 without blocking the user).
+        const oldest = await prismaAny.pldAttachment.findFirst({
+            where: {
+                category: params.category,
+                sectionId: params.sectionId ?? undefined,
+                questionId: params.questionId ?? undefined,
+            },
+            orderBy: { createdAt: 'asc' },
+        });
+        if (oldest?.id) {
+            await prismaAny.pldAttachment.delete({ where: { id: oldest.id } });
+            // Best-effort local cleanup (Supabase objects are not deleted here).
+            if ((0, storage_1.getStorageProvider)() !== 'supabase') {
+                this.bestEffortDeleteLocalUpload(oldest.path);
+            }
+        }
+    }
+    static ensureCapacityInPayloadAttachments(container, category) {
+        if (!container)
+            return;
+        if (!Array.isArray(container.attachments))
+            container.attachments = [];
+        const same = container.attachments
+            .map((a, idx) => ({ a, idx }))
+            .filter((x) => x.a?.category === category);
+        if (same.length < 5)
+            return;
+        // Remove oldest by uploadedAt if present; fallback to first.
+        let oldest = same[0];
+        for (const item of same) {
+            const tOld = new Date(oldest.a?.uploadedAt ?? 0).getTime();
+            const tCur = new Date(item.a?.uploadedAt ?? 0).getTime();
+            if (tCur < tOld)
+                oldest = item;
+        }
+        container.attachments.splice(oldest.idx, 1);
+    }
+    static async listSections(actor) {
+        this.ensureBuilderAccess(actor);
+        const where = this.getScopeWhere(actor);
         const sections = await prismaAny.pldSection.findMany({
+            where,
             include: {
                 attachments: true,
                 questions: {
@@ -53,30 +177,71 @@ class PldBuilderService {
         });
         return sections;
     }
-    static async createSection(data) {
-        const count = await prismaAny.pldSection.count();
+    static async createSection(actor, data) {
+        this.ensureBuilderAccess(actor);
+        const scopeWhere = this.getScopeWhere(actor);
+        if (actor.role === 'TRIAL_ADMIN') {
+            const existingSections = await prismaAny.pldSection.count({ where: scopeWhere });
+            if (existingSections >= 3) {
+                throw new Error('No modo de teste, você pode criar no máximo 3 itens de avaliação (seções).');
+            }
+        }
+        const count = await prismaAny.pldSection.count({ where: scopeWhere });
         return prismaAny.pldSection.create({
             data: {
                 ...data,
+                createdById: actor.role === 'ADMIN' ? undefined : actor.id,
                 order: count,
             },
         });
     }
-    static async updateSection(id, data) {
+    static async updateSection(actor, id, data) {
+        this.ensureBuilderAccess(actor);
+        // ADMIN bypasses ownership checks; still avoid Prisma 'record not found' errors.
+        const existing = await prismaAny.pldSection.findUnique({ where: { id }, select: { id: true } });
+        if (!existing)
+            throw new Error('Seção não encontrada');
+        await this.assertSectionWritable(prismaAny, actor, id);
+        if (actor.role !== 'ADMIN') {
+            // Prevent spoofing ownership.
+            delete data.createdById;
+        }
         return prismaAny.pldSection.update({ where: { id }, data });
     }
-    static async deleteSection(id) {
+    static async deleteSection(actor, id) {
+        this.ensureBuilderAccess(actor);
+        await this.assertSectionWritable(prismaAny, actor, id);
         await prismaAny.pldSection.delete({ where: { id } });
-        const remaining = await prismaAny.pldSection.findMany({ orderBy: { order: 'asc' } });
+        const remaining = await prismaAny.pldSection.findMany({
+            where: this.getScopeWhere(actor),
+            orderBy: { order: 'asc' },
+        });
         await Promise.all(remaining.map((s, idx) => prismaAny.pldSection.update({ where: { id: s.id }, data: { order: idx } })));
     }
-    static async reorderSections(sectionIds) {
+    static async reorderSections(actor, sectionIds) {
+        this.ensureBuilderAccess(actor);
+        if (actor.role !== 'ADMIN') {
+            const owned = await prismaAny.pldSection.findMany({ where: { id: { in: sectionIds } }, select: { id: true, createdById: true } });
+            if (owned.length !== sectionIds.length || owned.some((s) => s.createdById !== actor.id)) {
+                throw new Error('Você não tem permissão para reordenar estas seções');
+            }
+        }
         await Promise.all(sectionIds.map((id, idx) => prismaAny.pldSection.update({ where: { id }, data: { order: idx } })));
     }
-    static async createQuestion(sectionId, texto) {
+    static async createQuestion(actor, sectionId, texto) {
+        this.ensureBuilderAccess(actor);
         const section = await prismaAny.pldSection.findUnique({ where: { id: sectionId } });
         if (!section)
             throw new Error('Seção não encontrada');
+        if (actor.role !== 'ADMIN' && section.createdById !== actor.id) {
+            throw new Error('Você não tem permissão para editar esta seção');
+        }
+        if (actor.role === 'TRIAL_ADMIN') {
+            const totalQuestions = await prismaAny.pldQuestion.count({ where: { section: { createdById: actor.id } } });
+            if (totalQuestions >= 3) {
+                throw new Error('No modo de teste, você pode criar no máximo 3 questões.');
+            }
+        }
         const count = await prismaAny.pldQuestion.count({ where: { sectionId } });
         return prismaAny.pldQuestion.create({
             data: {
@@ -86,16 +251,28 @@ class PldBuilderService {
             },
         });
     }
-    static async updateQuestion(id, data) {
+    static async updateQuestion(actor, id, data) {
+        this.ensureBuilderAccess(actor);
+        // ADMIN bypasses ownership checks; still avoid Prisma 'record not found' errors.
+        const existing = await prismaAny.pldQuestion.findUnique({ where: { id }, select: { id: true } });
+        if (!existing)
+            throw new Error('Pergunta não encontrada');
+        await this.assertQuestionWritable(prismaAny, actor, id);
+        // DEBUG: Log para verificar o que está sendo recebido
+        console.log('[updateQuestion] id:', id, 'data.respondida:', data?.respondida);
         const cleaned = {
             ...data,
             actionDataApontamento: coerceDateTime(data?.actionDataApontamento),
             actionPrazoOriginal: coerceDateTime(data?.actionPrazoOriginal),
             actionPrazoAtual: coerceDateTime(data?.actionPrazoAtual),
         };
-        return prismaAny.pldQuestion.update({ where: { id }, data: cleaned });
+        const result = await prismaAny.pldQuestion.update({ where: { id }, data: cleaned });
+        console.log('[updateQuestion] result.respondida:', result?.respondida);
+        return result;
     }
-    static async deleteQuestion(id) {
+    static async deleteQuestion(actor, id) {
+        this.ensureBuilderAccess(actor);
+        await this.assertQuestionWritable(prismaAny, actor, id);
         const question = await prismaAny.pldQuestion.findUnique({ where: { id } });
         if (!question)
             return;
@@ -106,13 +283,602 @@ class PldBuilderService {
         });
         await Promise.all(remaining.map((q, idx) => prismaAny.pldQuestion.update({ where: { id: q.id }, data: { order: idx } })));
     }
-    static async reorderQuestions(sectionId, ids) {
+    static async reorderQuestions(actor, sectionId, ids) {
+        this.ensureBuilderAccess(actor);
+        if (actor.role === 'TRIAL_ADMIN') {
+            await this.assertSectionWritable(prismaAny, actor, sectionId);
+            const ownedQuestions = await prismaAny.pldQuestion.findMany({ where: { id: { in: ids } }, select: { id: true, sectionId: true } });
+            if (ownedQuestions.length !== ids.length || ownedQuestions.some((q) => q.sectionId !== sectionId)) {
+                throw new Error('Você não tem permissão para reordenar estas perguntas');
+            }
+        }
         await Promise.all(ids.map((id, idx) => prismaAny.pldQuestion.update({ where: { id, sectionId }, data: { order: idx } })));
     }
     static async addAttachment(params) {
-        const { file, category, referenceText, sectionId, questionId } = params;
+        const { actor, file, category, referenceText, sectionId, questionId } = params;
+        this.ensureBuilderAccess(actor);
+        if (sectionId)
+            await this.assertSectionWritable(prismaAny, actor, sectionId);
+        if (questionId)
+            await this.assertQuestionWritable(prismaAny, actor, questionId);
         if (!sectionId && !questionId) {
             throw new Error('sectionId ou questionId é obrigatório');
+        }
+        await this.ensureCapacityForBuilderAttachment({
+            category,
+            sectionId: sectionId ?? undefined,
+            questionId: questionId ?? undefined,
+        });
+        const relativePath = path_1.default
+            .relative((0, paths_1.getUploadsRoot)(), file.path)
+            .replace(/\\/g, '/')
+            .replace(/^\/+/, '');
+        if ((0, storage_1.getStorageProvider)() === 'supabase') {
+            const objectKey = relativePath || file.filename;
+            await (0, storage_1.uploadFileToStorage)({
+                localPath: file.path,
+                objectKey,
+                contentType: file.mimetype,
+                deleteLocal: true,
+            });
+        }
+        const publicPath = relativePath ? `uploads/${relativePath}` : `uploads/${file.filename}`;
+        return prismaAny.pldAttachment.create({
+            data: {
+                sectionId,
+                questionId,
+                category,
+                referenceText: referenceText || null,
+                filename: file.filename,
+                originalName: file.originalname,
+                path: publicPath,
+                mimeType: file.mimetype,
+                size: file.size,
+            },
+        });
+    }
+    static async deleteAttachment(actor, id) {
+        this.ensureBuilderAccess(actor);
+        if (actor.role !== 'ADMIN') {
+            const att = await prismaAny.pldAttachment.findUnique({
+                where: { id },
+                select: {
+                    id: true,
+                    sectionId: true,
+                    questionId: true,
+                    section: { select: { createdById: true } },
+                    question: { select: { section: { select: { createdById: true } } } },
+                },
+            });
+            if (!att)
+                return;
+            const ownerId = att.section?.createdById ?? att.question?.section?.createdById;
+            if (ownerId !== actor.id)
+                throw new Error('Você não tem permissão para remover este anexo');
+        }
+        await prismaAny.pldAttachment.delete({ where: { id } });
+    }
+    static async concludeBuilder(actor) {
+        this.ensureBuilderAccess(actor);
+        // Start a new report cycle by clearing all builder data.
+        // Order matters to satisfy FK constraints.
+        if (actor.role !== 'ADMIN') {
+            await prismaAny.pldAttachment.deleteMany({
+                where: {
+                    OR: [
+                        { section: { createdById: actor.id } },
+                        { question: { section: { createdById: actor.id } } },
+                    ],
+                },
+            });
+            await prismaAny.pldQuestion.deleteMany({ where: { section: { createdById: actor.id } } });
+            await prismaAny.pldSection.deleteMany({ where: { createdById: actor.id } });
+            return;
+        }
+        // ADMIN: limpar apenas o escopo do admin (createdById = null)
+        await prismaAny.pldAttachment.deleteMany({
+            where: {
+                OR: [{ section: { createdById: null } }, { question: { section: { createdById: null } } }],
+            },
+        });
+        await prismaAny.pldQuestion.deleteMany({ where: { section: { createdById: null } } });
+        await prismaAny.pldSection.deleteMany({ where: { createdById: null } });
+    }
+    static async concludeBuilderAndSaveForm(params) {
+        const name = params.name?.trim();
+        if (!name)
+            throw new Error('Nome do formulário é obrigatório');
+        const sentToEmail = params.sentToEmail?.trim() ? params.sentToEmail.trim().toLowerCase() : null;
+        const helpTexts = params.helpTexts ?? null;
+        const metadata = params.metadata ?? null;
+        const actor = (await database_1.default.user.findUnique({ where: { id: params.createdById } }));
+        if (!actor)
+            throw new Error('Usuário não encontrado');
+        this.ensureBuilderAccess(actor);
+        return prismaAny.$transaction(async (tx) => {
+            const where = this.getScopeWhere(actor);
+            const sections = await tx.pldSection.findMany({
+                where,
+                include: {
+                    attachments: true,
+                    questions: {
+                        include: { attachments: true },
+                        orderBy: { order: 'asc' },
+                    },
+                },
+                orderBy: { order: 'asc' },
+            });
+            const report = await tx.report.create({
+                data: {
+                    name,
+                    type: 'BUILDER_FORM',
+                    format: 'JSON',
+                    filePath: null,
+                    userId: params.createdById,
+                    status: 'COMPLETED',
+                    content: JSON.stringify({
+                        sentToEmail,
+                        sections,
+                        helpTexts,
+                        metadata,
+                    }),
+                },
+            });
+            // Clear builder data after snapshot is persisted.
+            if (actor.role !== 'ADMIN') {
+                await tx.pldAttachment.deleteMany({
+                    where: {
+                        OR: [
+                            { section: { createdById: actor.id } },
+                            { question: { section: { createdById: actor.id } } },
+                        ],
+                    },
+                });
+                await tx.pldQuestion.deleteMany({ where: { section: { createdById: actor.id } } });
+                await tx.pldSection.deleteMany({ where: { createdById: actor.id } });
+            }
+            else {
+                await tx.pldAttachment.deleteMany({
+                    where: {
+                        OR: [{ section: { createdById: null } }, { question: { section: { createdById: null } } }],
+                    },
+                });
+                await tx.pldQuestion.deleteMany({ where: { section: { createdById: null } } });
+                await tx.pldSection.deleteMany({ where: { createdById: null } });
+            }
+            return report;
+        });
+    }
+    static async listConcludedForms(actor) {
+        this.ensureBuilderAccess(actor);
+        const where = { type: 'BUILDER_FORM' };
+        if (actor.role !== 'ADMIN')
+            where.userId = actor.id;
+        const reports = await prismaAny.report.findMany({
+            where,
+            orderBy: { createdAt: 'desc' },
+        });
+        return reports.map((r) => {
+            let sentToEmail = null;
+            try {
+                const parsed = r.content ? JSON.parse(r.content) : null;
+                sentToEmail = typeof parsed?.sentToEmail === 'string' ? parsed.sentToEmail : null;
+            }
+            catch {
+                sentToEmail = null;
+            }
+            return {
+                id: r.id,
+                name: r.name,
+                createdAt: r.createdAt,
+                status: r.status || 'DRAFT',
+                sentToEmail,
+                assignedToEmail: r.assignedToEmail || null,
+                sentAt: r.sentAt || null,
+                submittedAt: r.submittedAt || null,
+            };
+        });
+    }
+    /**
+     * Lista formulários enviados para um usuário específico (pelo email).
+     * Usuários só podem ver formulários atribuídos a eles.
+     */
+    static async listFormsForUser(email) {
+        const normalizedEmail = email.toLowerCase();
+        const reports = await prismaAny.report.findMany({
+            where: {
+                type: 'BUILDER_FORM',
+                assignedToEmail: normalizedEmail,
+                status: {
+                    in: ['SENT_TO_USER', 'IN_PROGRESS', 'SENT_FOR_REVIEW', 'APPROVED', 'RETURNED', 'COMPLETED']
+                }
+            },
+            orderBy: { createdAt: 'desc' },
+        });
+        return reports.map((r) => ({
+            id: r.id,
+            name: r.name,
+            createdAt: r.createdAt,
+            status: r.status,
+            assignedToEmail: r.assignedToEmail,
+            sentAt: r.sentAt || null,
+            submittedAt: r.submittedAt || null,
+        }));
+    }
+    static async deleteForm(formId, actor) {
+        this.ensureBuilderAccess(actor);
+        const report = await prismaAny.report.findUnique({ where: { id: formId } });
+        if (!report || report.type !== 'BUILDER_FORM') {
+            throw new Error('Formulário não encontrado');
+        }
+        if (actor.role !== 'ADMIN' && report.userId !== actor.id) {
+            throw new Error('Você não tem permissão para excluir este formulário');
+        }
+        await prismaAny.report.delete({ where: { id: formId } });
+        return { success: true };
+    }
+    static async getConcludedFormById(id, actor) {
+        this.ensureBuilderAccess(actor);
+        const report = await prismaAny.report.findUnique({ where: { id } });
+        if (!report || report.type !== 'BUILDER_FORM')
+            return null;
+        if (actor.role !== 'ADMIN' && report.userId !== actor.id) {
+            throw new Error('Você não tem permissão para acessar este formulário');
+        }
+        let payload = null;
+        try {
+            payload = report.content ? JSON.parse(report.content) : null;
+        }
+        catch {
+            payload = null;
+        }
+        return {
+            id: report.id,
+            name: report.name,
+            createdAt: report.createdAt,
+            status: report.status || 'DRAFT',
+            sentToEmail: typeof payload?.sentToEmail === 'string' ? payload.sentToEmail : null,
+            assignedToEmail: report.assignedToEmail,
+            sections: Array.isArray(payload?.sections) ? payload.sections : [],
+            metadata: payload?.metadata || null,
+            helpTexts: payload?.helpTexts || null,
+        };
+    }
+    static async sendFormToUser(formId, email, actor, helpTexts) {
+        const report = await prismaAny.report.findUnique({ where: { id: formId } });
+        if (!report || report.type !== 'BUILDER_FORM') {
+            throw new Error('Formulário não encontrado');
+        }
+        if (actor.role === 'TRIAL_ADMIN' && report.userId !== actor.id) {
+            throw new Error('Você não tem permissão para gerenciar este formulário');
+        }
+        let nextContent = undefined;
+        if (helpTexts) {
+            let payload;
+            try {
+                payload = report.content ? JSON.parse(report.content) : null;
+            }
+            catch {
+                throw new Error('Conteúdo do formulário inválido');
+            }
+            if (!payload || typeof payload !== 'object') {
+                throw new Error('Conteúdo do formulário inválido');
+            }
+            payload.helpTexts = helpTexts;
+            nextContent = JSON.stringify(payload);
+        }
+        // Update status and assign to email
+        await prismaAny.report.update({
+            where: { id: formId },
+            data: {
+                status: 'SENT_TO_USER',
+                assignedToEmail: email.toLowerCase(),
+                sentAt: new Date(),
+                ...(nextContent ? { content: nextContent } : {}),
+            },
+        });
+        // OPCIONAL: Enviar email ao usuário
+        // Descomente as linhas abaixo quando configurar SMTP
+        /*
+        try {
+          const admin = await prismaAny.user.findUnique({ where: { id: actor.id } })
+          const { sendFormToUserEmail } = await import('./formEmail.service')
+          await sendFormToUserEmail({
+            to: email,
+            formName: report.name,
+            formId,
+            adminName: admin?.name,
+          })
+        } catch (emailError) {
+          console.error('Erro ao enviar email:', emailError)
+          // Não falha a operação se email falhar
+        }
+        */
+        return { success: true };
+    }
+    static async getUserForm(formId, userEmail) {
+        const report = await prismaAny.report.findUnique({ where: { id: formId } });
+        if (!report || report.type !== 'BUILDER_FORM') {
+            throw new Error('Formulário não encontrado');
+        }
+        // Check if user is assigned
+        if (report.assignedToEmail !== userEmail.toLowerCase()) {
+            throw new Error('Você não tem permissão para acessar este formulário');
+        }
+        let payload = null;
+        try {
+            payload = report.content ? JSON.parse(report.content) : null;
+        }
+        catch {
+            payload = null;
+        }
+        return {
+            id: report.id,
+            name: report.name,
+            createdAt: report.createdAt,
+            status: report.status || 'DRAFT',
+            sections: Array.isArray(payload?.sections) ? payload.sections : [],
+            metadata: payload?.metadata || null,
+            helpTexts: payload?.helpTexts || null,
+        };
+    }
+    static async saveUserFormResponses(formId, userEmail, answers, sections, metadata) {
+        const report = await prismaAny.report.findUnique({ where: { id: formId } });
+        if (!report || report.type !== 'BUILDER_FORM') {
+            throw new Error('Formulário não encontrado');
+        }
+        if (report.assignedToEmail !== userEmail.toLowerCase()) {
+            throw new Error('Você não tem permissão para editar este formulário');
+        }
+        const editableStatuses = new Set(['SENT_TO_USER', 'IN_PROGRESS', 'RETURNED']);
+        if (report.status && !editableStatuses.has(report.status)) {
+            throw new Error('Este formulário não pode mais ser editado');
+        }
+        // Parse existing content
+        let payload = null;
+        try {
+            payload = report.content ? JSON.parse(report.content) : null;
+        }
+        catch {
+            payload = { sections: [] };
+        }
+        // Update section responses (hasNorma, normaReferencia)
+        if (Array.isArray(sections) && Array.isArray(payload?.sections)) {
+            payload.sections.forEach((section) => {
+                const sectionUpdate = sections.find((s) => s.sectionId === section.id);
+                if (sectionUpdate) {
+                    if (typeof sectionUpdate.hasNorma === 'boolean') {
+                        section.hasNorma = sectionUpdate.hasNorma;
+                    }
+                    if (sectionUpdate.normaReferencia !== undefined) {
+                        section.normaReferencia = sectionUpdate.normaReferencia || null;
+                    }
+                }
+            });
+        }
+        // Update question responses
+        if (Array.isArray(payload?.sections)) {
+            payload.sections.forEach((section) => {
+                if (Array.isArray(section.questions)) {
+                    section.questions.forEach((question) => {
+                        const answer = answers.find((a) => a.questionId === question.id);
+                        if (answer) {
+                            // Aplicabilidade da questão (definido pelo usuário)
+                            if (typeof answer.aplicavel === 'boolean') {
+                                question.aplicavel = answer.aplicavel;
+                            }
+                            question.resposta = answer.resposta || null;
+                            question.respostaTexto = answer.respostaTexto || null;
+                            question.deficienciaTexto = answer.deficienciaTexto || null;
+                            question.recomendacaoTexto = answer.recomendacaoTexto || null;
+                            // Campos de teste
+                            question.testStatus = answer.testStatus || null;
+                            question.testDescription = answer.testDescription || null;
+                            // Referências de teste
+                            question.requisicaoRef = answer.requisicaoRef || null;
+                            question.respostaTesteRef = answer.respostaTesteRef || null;
+                            question.amostraRef = answer.amostraRef || null;
+                            question.evidenciasRef = answer.evidenciasRef || null;
+                            // Campos de plano de ação
+                            question.actionOrigem = answer.actionOrigem || null;
+                            question.actionResponsavel = answer.actionResponsavel || null;
+                            question.actionDescricao = answer.actionDescricao || null;
+                            question.actionDataApontamento = coerceDateTime(answer.actionDataApontamento);
+                            question.actionPrazoOriginal = coerceDateTime(answer.actionPrazoOriginal);
+                            question.actionPrazoAtual = coerceDateTime(answer.actionPrazoAtual);
+                            question.actionComentarios = answer.actionComentarios || null;
+                        }
+                    });
+                }
+            });
+        }
+        // Salvar metadados do formulário (instituições, qualificação, opções)
+        if (metadata) {
+            payload.metadata = {
+                instituicoes: metadata.instituicoes || [],
+                qualificacaoAvaliador: metadata.qualificacaoAvaliador || '',
+                mostrarMetodologia: metadata.mostrarMetodologia || 'MOSTRAR',
+                incluirRecomendacoes: metadata.incluirRecomendacoes || 'INCLUIR',
+            };
+        }
+        // Update report with new responses
+        await prismaAny.report.update({
+            where: { id: formId },
+            data: {
+                content: JSON.stringify(payload),
+                status: 'IN_PROGRESS',
+            },
+        });
+        return { success: true };
+    }
+    static async completeUserForm(formId, userEmail) {
+        const report = await prismaAny.report.findUnique({ where: { id: formId } });
+        if (!report || report.type !== 'BUILDER_FORM') {
+            throw new Error('Formulário não encontrado');
+        }
+        if (report.assignedToEmail !== userEmail.toLowerCase()) {
+            throw new Error('Você não tem permissão para concluir este formulário');
+        }
+        const editableStatuses = new Set(['SENT_TO_USER', 'IN_PROGRESS', 'RETURNED']);
+        if (report.status && !editableStatuses.has(report.status)) {
+            throw new Error('Este formulário não pode mais ser concluído');
+        }
+        let payload = null;
+        try {
+            payload = report.content ? JSON.parse(report.content) : null;
+        }
+        catch {
+            payload = null;
+        }
+        const sections = Array.isArray(payload?.sections) ? payload.sections : [];
+        let totalApplicable = 0;
+        let totalAnswered = 0;
+        for (const section of sections) {
+            const questions = Array.isArray(section?.questions) ? section.questions : [];
+            for (const question of questions) {
+                const applicable = question?.aplicavel !== false;
+                if (!applicable)
+                    continue;
+                totalApplicable += 1;
+                const r = question?.resposta;
+                const answered = !(r === null || r === undefined || (typeof r === 'string' && r.trim() === ''));
+                if (answered)
+                    totalAnswered += 1;
+            }
+        }
+        if (totalApplicable === 0 || totalAnswered < totalApplicable) {
+            throw new Error('Formulário deve estar 100% preenchido para concluir');
+        }
+        await prismaAny.report.update({
+            where: { id: formId },
+            data: {
+                status: 'COMPLETED',
+                submittedAt: new Date(),
+            },
+        });
+        return { success: true };
+    }
+    static async submitUserFormForReview(formId, userEmail, answers, sections, metadata) {
+        // First save responses
+        await this.saveUserFormResponses(formId, userEmail, answers, sections, metadata);
+        // Then update status to SENT_FOR_REVIEW
+        const report = await prismaAny.report.update({
+            where: { id: formId },
+            data: {
+                status: 'SENT_FOR_REVIEW',
+                submittedAt: new Date(),
+            },
+        });
+        // OPCIONAL: Notificar admin por email
+        // Descomente as linhas abaixo quando configurar SMTP
+        /*
+        try {
+          const admin = await prismaAny.user.findUnique({ where: { id: report.userId } })
+          if (admin?.email) {
+            const { sendFormSubmittedEmail } = await import('./formEmail.service')
+            await sendFormSubmittedEmail({
+              to: admin.email,
+              formName: report.name,
+              formId,
+              userEmail,
+            })
+          }
+        } catch (emailError) {
+          console.error('Erro ao enviar email:', emailError)
+        }
+        */
+        return { success: true };
+    }
+    static async approveForm(formId, actor) {
+        const report = await prismaAny.report.findUnique({ where: { id: formId } });
+        if (!report || report.type !== 'BUILDER_FORM') {
+            throw new Error('Formulário não encontrado');
+        }
+        if (actor.role === 'TRIAL_ADMIN' && report.userId !== actor.id) {
+            throw new Error('Você não tem permissão para gerenciar este formulário');
+        }
+        await prismaAny.report.update({
+            where: { id: formId },
+            data: {
+                status: 'APPROVED',
+                reviewedAt: new Date(),
+            },
+        });
+        return { success: true };
+    }
+    static async returnForm(formId, actor, reason) {
+        const report = await prismaAny.report.findUnique({ where: { id: formId } });
+        if (!report || report.type !== 'BUILDER_FORM') {
+            throw new Error('Formulário não encontrado');
+        }
+        if (actor.role === 'TRIAL_ADMIN' && report.userId !== actor.id) {
+            throw new Error('Você não tem permissão para gerenciar este formulário');
+        }
+        await prismaAny.report.update({
+            where: { id: formId },
+            data: {
+                status: 'RETURNED',
+                reviewedAt: new Date(),
+            },
+        });
+        // OPCIONAL: Notificar usuário por email
+        // Descomente as linhas abaixo quando configurar SMTP
+        /*
+        try {
+          if (report.assignedToEmail) {
+            const { sendFormReturnedEmail } = await import('./formEmail.service')
+            await sendFormReturnedEmail({
+              to: report.assignedToEmail,
+              formName: report.name,
+              formId,
+              reason,
+            })
+          }
+        } catch (emailError) {
+          console.error('Erro ao enviar email:', emailError)
+        }
+        */
+        return { success: true };
+    }
+    /**
+     * Upload de arquivo pelo usuário para uma questão de um formulário.
+     * Os arquivos são salvos dentro do JSON content do report.
+     */
+    static async uploadUserFormAttachment(params) {
+        const { formId, userEmail, questionId, sectionId, file, category, referenceText } = params;
+        const report = await prismaAny.report.findUnique({ where: { id: formId } });
+        if (!report || report.type !== 'BUILDER_FORM') {
+            throw new Error('Formulário não encontrado');
+        }
+        if (report.assignedToEmail !== userEmail.toLowerCase()) {
+            throw new Error('Você não tem permissão para editar este formulário');
+        }
+        // Parse existing content
+        let payload = null;
+        try {
+            payload = report.content ? JSON.parse(report.content) : null;
+        }
+        catch {
+            payload = { sections: [] };
+        }
+        // For user-form JSON attachments, keep at most 5 by removing the oldest.
+        if (Array.isArray(payload?.sections)) {
+            if (sectionId) {
+                const section = payload.sections.find((s) => s.id === sectionId);
+                if (section)
+                    this.ensureCapacityInPayloadAttachments(section, category);
+            }
+            if (questionId) {
+                for (const section of payload.sections) {
+                    if (Array.isArray(section.questions)) {
+                        const question = section.questions.find((q) => q.id === questionId);
+                        if (question) {
+                            this.ensureCapacityInPayloadAttachments(question, category);
+                            break;
+                        }
+                    }
+                }
+            }
         }
         const relativePath = path_1.default
             .relative((0, paths_1.getUploadsRoot)(), file.path)
@@ -128,38 +894,51 @@ class PldBuilderService {
             });
         }
         const publicPath = relativePath ? `uploads/${relativePath}` : `uploads/${file.filename}`;
-        // Para o builder, cada categoria representa um único arquivo (por seção/pergunta).
-        // Evita duplicação ao salvar o builder várias vezes.
-        await prismaAny.pldAttachment.deleteMany({
-            where: {
-                category,
-                sectionId: sectionId ?? undefined,
-                questionId: questionId ?? undefined,
-            },
-        });
-        return prismaAny.pldAttachment.create({
+        const newAttachment = {
+            id: `att_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`,
+            category,
+            referenceText: referenceText || null,
+            filename: file.filename,
+            originalName: file.originalname,
+            path: publicPath,
+            mimeType: file.mimetype,
+            size: file.size,
+            uploadedAt: new Date().toISOString(),
+        };
+        // Add attachment to section or question
+        if (Array.isArray(payload?.sections)) {
+            if (sectionId) {
+                const section = payload.sections.find((s) => s.id === sectionId);
+                if (section) {
+                    if (!Array.isArray(section.attachments)) {
+                        section.attachments = [];
+                    }
+                    section.attachments.push(newAttachment);
+                }
+            }
+            if (questionId) {
+                for (const section of payload.sections) {
+                    if (Array.isArray(section.questions)) {
+                        const question = section.questions.find((q) => q.id === questionId);
+                        if (question) {
+                            if (!Array.isArray(question.attachments)) {
+                                question.attachments = [];
+                            }
+                            question.attachments.push(newAttachment);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        // Update report with new content
+        await prismaAny.report.update({
+            where: { id: formId },
             data: {
-                sectionId,
-                questionId,
-                category,
-                referenceText: referenceText || null,
-                filename: file.filename,
-                originalName: file.originalname,
-                path: publicPath,
-                mimeType: file.mimetype,
-                size: file.size,
+                content: JSON.stringify(payload),
             },
         });
-    }
-    static async deleteAttachment(id) {
-        await prismaAny.pldAttachment.delete({ where: { id } });
-    }
-    static async concludeBuilder() {
-        // Start a new report cycle by clearing all builder data.
-        // Order matters to satisfy FK constraints.
-        await prismaAny.pldAttachment.deleteMany({});
-        await prismaAny.pldQuestion.deleteMany({});
-        await prismaAny.pldSection.deleteMany({});
+        return { attachment: newAttachment };
     }
 }
 exports.PldBuilderService = PldBuilderService;

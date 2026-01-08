@@ -13,12 +13,28 @@ const form_services_1 = require("./form.services");
 const paths_1 = require("../config/paths");
 const storage_1 = require("../config/storage");
 class ReportService {
+    static sanitizeQuestionTitle(raw) {
+        if (typeof raw !== "string")
+            return "-";
+        const title = raw.trim();
+        if (!title)
+            return "-";
+        // Bloqueia padrões comuns de segredos/tokens/hashes que jamais deveriam ser um título de pergunta.
+        // Ex.: bcrypt ($2a$/$2b$/$2y$), argon2 ($argon2id$), JWT (xxx.yyy.zzz)
+        const looksLikeBcrypt = /^\$2[aby]\$\d{2}\$/.test(title);
+        const looksLikeArgon2 = /^\$argon2(id|i|d)\$/.test(title);
+        const looksLikeJwt = /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(title);
+        const looksLikeLongHex = title.length >= 32 && /^[a-f0-9]+$/i.test(title);
+        const looksLikeLongNoSpaces = title.length >= 60 && !/\s/.test(title);
+        if (looksLikeBcrypt || looksLikeArgon2 || looksLikeJwt || (looksLikeLongHex && looksLikeLongNoSpaces)) {
+            return "[DADO SENSÍVEL REMOVIDO]";
+        }
+        return title;
+    }
     static buildDocxCard(children) {
-        // Approx A4 page content width with default 1" margins: ~6.5" => 9360 twips.
-        // Use a safe fixed width to prevent Word from collapsing/minimizing the table.
-        const cardWidthTwips = 9360;
+        const cardWidthTwips = 9360; //Largura da A4 com margens de 1 polegada
         return new docx_1.Table({
-            layout: docx_1.TableLayoutType.FIXED,
+            layout: docx_1.TableLayoutType.FIXED, //evita quebras estranhas
             width: { size: cardWidthTwips, type: docx_1.WidthType.DXA },
             columnWidths: [cardWidthTwips],
             borders: {
@@ -95,12 +111,698 @@ class ReportService {
             ],
         });
     }
-    static async generatePldBuilderReport(userId, format = "DOCX") {
-        const user = await database_1.default.user.findUnique({ where: { id: userId } });
+    static async generatePldUserFormReport(formId, requester, format = "PDF") {
+        const requesterUser = await database_1.default.user.findUnique({
+            where: { id: requester.requesterId },
+            select: { id: true, name: true, email: true, role: true },
+        });
+        if (!requesterUser)
+            throw new Error("Usuário não encontrado");
+        const reportForm = await database_1.default.report.findUnique({ where: { id: formId } });
+        if (!reportForm || reportForm.type !== "BUILDER_FORM") {
+            throw new Error("Formulário não encontrado");
+        }
+        const requesterRole = (requester.requesterRole || requesterUser.role || "").toUpperCase();
+        const requesterEmail = (requester.requesterEmail || requesterUser.email || "").toLowerCase();
+        // Permissões:
+        // - ADMIN pode gerar
+        // - TRIAL_ADMIN pode gerar se for o dono do formulário
+        // - usuário comum só se for o email atribuído
+        if (requesterRole === "ADMIN") {
+            // ok
+        }
+        else if (requesterRole === "TRIAL_ADMIN") {
+            if (reportForm.userId !== requesterUser.id) {
+                throw new Error("Você não tem permissão para gerar este relatório");
+            }
+        }
+        else {
+            const assigned = (reportForm.assignedToEmail || "").toLowerCase();
+            if (!assigned || assigned !== requesterEmail) {
+                throw new Error("Você não tem permissão para gerar este relatório");
+            }
+        }
+        let payload = null;
+        try {
+            payload = reportForm.content ? JSON.parse(reportForm.content) : null;
+        }
+        catch {
+            payload = null;
+        }
+        if (!payload || typeof payload !== "object") {
+            throw new Error("Conteúdo do formulário inválido");
+        }
+        const sections = Array.isArray(payload.sections) ? payload.sections : [];
+        const metadata = payload.metadata || null;
+        const helpTexts = payload.helpTexts || null;
+        const introInstituicoes = Array.isArray(metadata?.instituicoes)
+            ? metadata.instituicoes
+            : [];
+        const introAvaliador = (metadata?.qualificacaoAvaliador || "").toString().trim();
+        const mostrarMetodologia = (metadata?.mostrarMetodologia || "MOSTRAR").toString();
+        const incluirRecomendacoes = (metadata?.incluirRecomendacoes || "INCLUIR").toString();
+        const baseUrl = (process.env.PUBLIC_BASE_URL || "http://localhost:3001")
+            .replace(/\/api\/?$/, "")
+            .replace(/\/+$/, "");
+        const generatedAt = new Date().toLocaleString("pt-BR");
+        const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+        const reportsDir = (0, paths_1.getReportsDir)();
+        const title = "Relatório PLD";
+        const formName = (reportForm.name || "Formulário").toString().trim() || "Formulário";
+        const reportName = `Relatório PLD - ${formName}`;
+        const safeDate = (value) => {
+            if (!value)
+                return null;
+            const d = new Date(value);
+            if (Number.isNaN(d.getTime()))
+                return null;
+            return d;
+        };
+        if (format === "DOCX") {
+            const filename = `pld-form-report-${formId}-${timestamp}.docx`;
+            const filePath = path_1.default.join(reportsDir, filename);
+            const children = [
+                new docx_1.Paragraph({
+                    text: title,
+                    heading: docx_1.HeadingLevel.TITLE,
+                    alignment: docx_1.AlignmentType.CENTER,
+                }),
+                new docx_1.Paragraph({
+                    alignment: docx_1.AlignmentType.CENTER,
+                    spacing: { after: 240 },
+                    children: [
+                        new docx_1.TextRun({
+                            text: `Gerado por: ${requesterUser.name} <${requesterUser.email}>`,
+                            break: 1,
+                        }),
+                        new docx_1.TextRun({ text: `Formulário: ${formName}`, break: 1 }),
+                        new docx_1.TextRun({
+                            text: reportForm.assignedToEmail
+                                ? `Atribuído a: ${reportForm.assignedToEmail}`
+                                : "",
+                            break: reportForm.assignedToEmail ? 1 : 0,
+                        }),
+                        new docx_1.TextRun({ text: `Data: ${generatedAt}`, break: 1 }),
+                    ].filter(Boolean),
+                }),
+                new docx_1.Paragraph({ text: "Introdução", heading: docx_1.HeadingLevel.HEADING_1 }),
+                ...(introInstituicoes.length
+                    ? [
+                        new docx_1.Paragraph({
+                            spacing: { after: 120 },
+                            children: [new docx_1.TextRun({ text: "Instituição(ões)", bold: true })],
+                        }),
+                        ...introInstituicoes.map((inst) => new docx_1.Paragraph({
+                            bullet: { level: 0 },
+                            children: [
+                                new docx_1.TextRun({
+                                    text: `${((inst?.nome || "-") + "").trim()}${inst?.cnpj ? ` (CNPJ: ${inst.cnpj})` : ""}`,
+                                }),
+                            ],
+                        })),
+                    ]
+                    : [
+                        new docx_1.Paragraph({
+                            spacing: { after: 120 },
+                            children: [new docx_1.TextRun({ text: "Instituição(ões): -", bold: true })],
+                        }),
+                    ]),
+                new docx_1.Paragraph({
+                    spacing: { before: 120, after: 120 },
+                    children: [new docx_1.TextRun({ text: "Descrição do avaliador", bold: true })],
+                }),
+                new docx_1.Paragraph({ text: introAvaliador || "-", spacing: { after: 160 } }),
+                new docx_1.Paragraph({ text: "Configurações", heading: docx_1.HeadingLevel.HEADING_1 }),
+                ReportService.buildDocxCard([
+                    ReportService.buildLabelValueParagraph("Metodologia - Resultado da Avaliação", mostrarMetodologia === "MOSTRAR" ? "MOSTRAR" : "NÃO MOSTRAR"),
+                    ReportService.buildLabelValueParagraph("Recomendações", incluirRecomendacoes === "INCLUIR" ? "INCLUIR" : "NÃO INCLUIR", { spacingAfter: 0 }),
+                ]),
+                new docx_1.Paragraph({ text: "", spacing: { after: 200 } }),
+            ];
+            if (mostrarMetodologia === "MOSTRAR") {
+                children.push(new docx_1.Paragraph({
+                    text: "Metodologia - Resultado da Avaliação",
+                    heading: docx_1.HeadingLevel.HEADING_1,
+                }));
+                const metodologiaTexto = typeof helpTexts?.metodologia === "string" ? helpTexts.metodologia.trim() : "";
+                children.push(new docx_1.Paragraph({ text: metodologiaTexto || "-", spacing: { after: 200 } }));
+            }
+            sections.forEach((section) => {
+                const sectionLabel = (section?.customLabel || "").trim()
+                    ? `${section.item} - ${section.customLabel}`
+                    : section.item;
+                children.push(new docx_1.Paragraph({ text: sectionLabel || "-", heading: docx_1.HeadingLevel.HEADING_1 }));
+                if (section?.descricao) {
+                    children.push(new docx_1.Paragraph({ text: String(section.descricao), spacing: { after: 160 } }));
+                }
+                if (typeof section?.hasNorma === "boolean") {
+                    children.push(ReportService.buildDocxCard([
+                        ReportService.buildLabelValueParagraph("Possui norma interna", section.hasNorma ? "Sim" : "Não"),
+                        ReportService.buildLabelValueParagraph("Norma (referência)", section.normaReferencia ? String(section.normaReferencia) : "-", { spacingAfter: 0 }),
+                    ]));
+                    children.push(new docx_1.Paragraph({ text: "", spacing: { after: 160 } }));
+                }
+                const normaFiles = (section?.attachments || []).filter((a) => a?.category === "NORMA");
+                const uniqueNormaFiles = Array.from(normaFiles
+                    .reduce((acc, att) => {
+                    acc.set(`${att.category}|${att.path}`, att);
+                    return acc;
+                }, new Map())
+                    .values());
+                if (uniqueNormaFiles.length > 0) {
+                    const normaCard = [
+                        new docx_1.Paragraph({
+                            children: [new docx_1.TextRun({ text: "Norma interna (arquivos)", bold: true })],
+                            spacing: { after: 120 },
+                        }),
+                    ];
+                    uniqueNormaFiles.forEach((att) => {
+                        const link = ReportService.buildBuilderAttachmentLink(att, baseUrl);
+                        normaCard.push(new docx_1.Paragraph({
+                            bullet: { level: 0 },
+                            children: [
+                                new docx_1.ExternalHyperlink({
+                                    link,
+                                    children: [
+                                        new docx_1.TextRun({
+                                            text: att.originalName || att.filename || "Arquivo",
+                                            style: "Hyperlink",
+                                            color: "0563C1",
+                                            underline: {},
+                                        }),
+                                    ],
+                                }),
+                            ],
+                        }));
+                    });
+                    children.push(ReportService.buildDocxCard(normaCard));
+                    children.push(new docx_1.Paragraph({ text: "", spacing: { after: 160 } }));
+                }
+                (section?.questions || []).forEach((question, index) => {
+                    const card = [
+                        ReportService.buildDocxCardTitle(`${index + 1}. ${ReportService.sanitizeQuestionTitle(question?.texto)}`),
+                        ReportService.buildLabelValueParagraph("Aplicável", question?.aplicavel ? "Sim" : "Não"),
+                    ];
+                    if (question?.capitulacao)
+                        card.push(ReportService.buildLabelValueParagraph("Capitulação", String(question.capitulacao)));
+                    if (question?.criticidade)
+                        card.push(ReportService.buildLabelValueParagraph("Criticidade", String(question.criticidade)));
+                    if (question?.resposta)
+                        card.push(ReportService.buildLabelValueParagraph("Resposta", String(question.resposta)));
+                    if (question?.respostaTexto)
+                        card.push(ReportService.buildLabelValueParagraph("Resposta (texto)", String(question.respostaTexto)));
+                    if (question?.deficienciaTexto)
+                        card.push(ReportService.buildLabelValueParagraph("Deficiência", String(question.deficienciaTexto)));
+                    if (incluirRecomendacoes === "INCLUIR" && question?.recomendacaoTexto)
+                        card.push(ReportService.buildLabelValueParagraph("Recomendação", String(question.recomendacaoTexto)));
+                    if (question?.testStatus)
+                        card.push(ReportService.buildLabelValueParagraph("Teste (status)", String(question.testStatus)));
+                    if (question?.testDescription)
+                        card.push(ReportService.buildLabelValueParagraph("Teste (descrição)", String(question.testDescription)));
+                    if (question?.requisicaoRef)
+                        card.push(ReportService.buildLabelValueParagraph("Referência (requisição)", String(question.requisicaoRef)));
+                    if (question?.respostaTesteRef)
+                        card.push(ReportService.buildLabelValueParagraph("Referência (resposta do teste)", String(question.respostaTesteRef)));
+                    if (question?.amostraRef)
+                        card.push(ReportService.buildLabelValueParagraph("Referência (amostra)", String(question.amostraRef)));
+                    if (question?.evidenciasRef)
+                        card.push(ReportService.buildLabelValueParagraph("Referência (evidências)", String(question.evidenciasRef)));
+                    if (question?.actionOrigem)
+                        card.push(ReportService.buildLabelValueParagraph("Ação (origem)", String(question.actionOrigem)));
+                    if (question?.actionResponsavel)
+                        card.push(ReportService.buildLabelValueParagraph("Ação (responsável)", String(question.actionResponsavel)));
+                    if (question?.actionDescricao)
+                        card.push(ReportService.buildLabelValueParagraph("Ação (descrição)", String(question.actionDescricao)));
+                    const dataAp = safeDate(question?.actionDataApontamento);
+                    if (dataAp)
+                        card.push(ReportService.buildLabelValueParagraph("Ação (data apontamento)", dataAp.toLocaleDateString("pt-BR")));
+                    const prazoOrig = safeDate(question?.actionPrazoOriginal);
+                    if (prazoOrig)
+                        card.push(ReportService.buildLabelValueParagraph("Ação (prazo original)", prazoOrig.toLocaleDateString("pt-BR")));
+                    const prazoAt = safeDate(question?.actionPrazoAtual);
+                    if (prazoAt)
+                        card.push(ReportService.buildLabelValueParagraph("Ação (prazo atual)", prazoAt.toLocaleDateString("pt-BR")));
+                    if (question?.actionComentarios)
+                        card.push(ReportService.buildLabelValueParagraph("Ação (comentários)", String(question.actionComentarios)));
+                    const atts = Array.isArray(question?.attachments) ? question.attachments : [];
+                    const uniqueAtts = Array.from(atts
+                        .reduce((acc, att) => {
+                        acc.set(`${att.category}|${att.path}`, att);
+                        return acc;
+                    }, new Map())
+                        .values());
+                    if (uniqueAtts.length > 0) {
+                        card.push(ReportService.buildDocxCardSectionTitle("Arquivos"));
+                        uniqueAtts.forEach((att) => {
+                            const link = ReportService.buildBuilderAttachmentLink(att, baseUrl);
+                            card.push(new docx_1.Paragraph({
+                                bullet: { level: 0 },
+                                children: [
+                                    new docx_1.TextRun({ text: `[${att.category}] ` }),
+                                    new docx_1.ExternalHyperlink({
+                                        link,
+                                        children: [
+                                            new docx_1.TextRun({
+                                                text: att.originalName || att.filename || "Arquivo",
+                                                style: "Hyperlink",
+                                                color: "0563C1",
+                                                underline: {},
+                                            }),
+                                        ],
+                                    }),
+                                ],
+                            }));
+                            if (att.referenceText) {
+                                card.push(new docx_1.Paragraph({
+                                    indent: { left: 360 },
+                                    children: [new docx_1.TextRun({ text: `Referência: ${att.referenceText}` })],
+                                }));
+                            }
+                        });
+                    }
+                    children.push(ReportService.buildDocxCard(card));
+                    children.push(new docx_1.Paragraph({ text: "", spacing: { after: 160 } }));
+                });
+                children.push(new docx_1.Paragraph({ text: "", spacing: { after: 200 } }));
+            });
+            const doc = new docx_1.Document({
+                sections: [
+                    {
+                        properties: {},
+                        children: children,
+                    },
+                ],
+            });
+            const buffer = await docx_1.Packer.toBuffer(doc);
+            fs_1.default.writeFileSync(filePath, buffer);
+            if ((0, storage_1.getStorageProvider)() === "supabase") {
+                await (0, storage_1.uploadFileToStorage)({
+                    localPath: filePath,
+                    objectKey: `reports/${filename}`,
+                    contentType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    deleteLocal: true,
+                });
+            }
+            const report = await database_1.default.report.create({
+                data: {
+                    name: reportName,
+                    type: "BUILDER_FORM_USER_REPORT",
+                    format: "DOCX",
+                    content: null,
+                    filePath: path_1.default.join("uploads", "reports", filename),
+                    userId: requesterUser.id,
+                },
+            });
+            return report;
+        }
+        // PDF
+        const filename = `pld-form-report-${formId}-${timestamp}.pdf`;
+        const filePath = path_1.default.join(reportsDir, filename);
+        const pdf = new pdfkit_1.default({ margin: 50, size: "A4" });
+        const stream = fs_1.default.createWriteStream(filePath);
+        pdf.pipe(stream);
+        const marginLeft = pdf.page.margins.left;
+        const marginRight = pdf.page.margins.right;
+        const contentWidth = pdf.page.width - marginLeft - marginRight;
+        const lineColor = "#e2e8f0";
+        const textMuted = "#475569";
+        const textDark = "#0f172a";
+        const linkColor = "#1d4ed8";
+        const ensureSpace = (minSpace) => {
+            const bottom = pdf.page.height - pdf.page.margins.bottom;
+            if (pdf.y + minSpace > bottom) {
+                pdf.addPage();
+            }
+        };
+        const hr = () => {
+            ensureSpace(14);
+            pdf.moveDown(0.2);
+            pdf
+                .moveTo(marginLeft, pdf.y)
+                .lineTo(marginLeft + contentWidth, pdf.y)
+                .strokeColor(lineColor)
+                .stroke();
+            pdf.moveDown(0.6);
+        };
+        const h1 = (text) => {
+            ensureSpace(40);
+            pdf
+                .fillColor(textDark)
+                .font("Helvetica-Bold")
+                .fontSize(18)
+                .text(text, { align: "center" });
+            pdf.moveDown(0.8);
+        };
+        const h2 = (text) => {
+            ensureSpace(30);
+            pdf
+                .fillColor(textDark)
+                .font("Helvetica-Bold")
+                .fontSize(14)
+                .text(text, marginLeft, pdf.y, { width: contentWidth });
+            pdf.moveDown(0.4);
+        };
+        const h3 = (text) => {
+            ensureSpace(24);
+            pdf
+                .fillColor(textDark)
+                .font("Helvetica-Bold")
+                .fontSize(12)
+                .text(text, marginLeft, pdf.y, { width: contentWidth });
+            pdf.moveDown(0.3);
+        };
+        const p = (text) => {
+            ensureSpace(24);
+            pdf
+                .fillColor(textMuted)
+                .font("Helvetica")
+                .fontSize(10.5)
+                .text(text, marginLeft, pdf.y, { width: contentWidth, lineGap: 2 });
+            pdf.moveDown(0.3);
+        };
+        const kv = (label, value, x = marginLeft, width = contentWidth) => {
+            ensureSpace(18);
+            pdf
+                .fillColor(textDark)
+                .font("Helvetica-Bold")
+                .fontSize(10)
+                .text(`${label}: `, x, pdf.y, { continued: true, width });
+            pdf
+                .fillColor(textMuted)
+                .font("Helvetica")
+                .fontSize(10)
+                .text(value || "-", { width, lineGap: 1 });
+        };
+        const measureTextHeight = (text, options) => {
+            const { width, font = "Helvetica", fontSize, lineGap = 0 } = options;
+            return pdf
+                .font(font)
+                .fontSize(fontSize)
+                .heightOfString(text || "-", { width, lineGap });
+        };
+        h1(title);
+        pdf
+            .fillColor(textMuted)
+            .font("Helvetica")
+            .fontSize(11)
+            .text(`Gerado por: ${requesterUser.name} <${requesterUser.email}>`, {
+            align: "center",
+        });
+        pdf.text(`Formulário: ${formName}`, { align: "center" });
+        if (reportForm.assignedToEmail) {
+            pdf.text(`Atribuído a: ${reportForm.assignedToEmail}`, { align: "center" });
+        }
+        pdf.text(`Data: ${generatedAt}`, { align: "center" });
+        pdf.moveDown(1.0);
+        hr();
+        h2("Introdução");
+        if (introInstituicoes.length > 0) {
+            h3("Instituição(ões)");
+            introInstituicoes.forEach((inst, idx) => {
+                const nome = ((inst?.nome || "-") + "").trim() || "-";
+                const cnpj = ((inst?.cnpj || "") + "").trim();
+                p(`${idx + 1}. ${nome}${cnpj ? ` (CNPJ: ${cnpj})` : ""}`);
+            });
+        }
+        else {
+            p("Instituição(ões): -");
+        }
+        h3("Descrição do avaliador");
+        p(introAvaliador || "-");
+        hr();
+        h2("Configurações");
+        kv("Metodologia - Resultado da Avaliação", mostrarMetodologia === "MOSTRAR" ? "MOSTRAR" : "NÃO MOSTRAR");
+        kv("Recomendações", incluirRecomendacoes === "INCLUIR" ? "INCLUIR" : "NÃO INCLUIR");
+        hr();
+        if (mostrarMetodologia === "MOSTRAR") {
+            h2("Metodologia - Resultado da Avaliação");
+            const metodologiaTexto = typeof helpTexts?.metodologia === "string" ? helpTexts.metodologia.trim() : "";
+            p(metodologiaTexto || "-");
+            hr();
+        }
+        sections.forEach((section, sectionIndex) => {
+            if (sectionIndex > 0) {
+                pdf.addPage();
+            }
+            const sectionLabel = (section?.customLabel || "").trim()
+                ? `${section.item} - ${section.customLabel}`
+                : section.item;
+            h2(sectionLabel || "-");
+            if (section?.descricao) {
+                p(String(section.descricao));
+            }
+            if (typeof section?.hasNorma === "boolean") {
+                kv("Possui norma interna", section.hasNorma ? "Sim" : "Não");
+                kv("Norma (referência)", section.normaReferencia ? String(section.normaReferencia) : "-");
+                pdf.moveDown(0.4);
+            }
+            const normaFiles = (section?.attachments || []).filter((a) => a?.category === "NORMA");
+            const uniqueNormaFiles = Array.from(normaFiles
+                .reduce((acc, att) => {
+                acc.set(`${att.category}|${att.path}`, att);
+                return acc;
+            }, new Map())
+                .values());
+            if (uniqueNormaFiles.length > 0) {
+                h3("Norma interna (arquivos)");
+                uniqueNormaFiles.forEach((att, idx) => {
+                    ensureSpace(18);
+                    const link = ReportService.buildBuilderAttachmentLink(att, baseUrl);
+                    pdf
+                        .fillColor(linkColor)
+                        .font("Helvetica")
+                        .fontSize(10.5)
+                        .text(`${idx + 1}. ${att.originalName || att.filename || "Arquivo"}`, marginLeft, pdf.y, {
+                        width: contentWidth,
+                        link,
+                        underline: true,
+                        lineGap: 2,
+                    });
+                    pdf.fillColor(textMuted);
+                });
+                pdf.moveDown(0.6);
+            }
+            hr();
+            (section?.questions || []).forEach((question, index) => {
+                const boxX = marginLeft;
+                const boxW = contentWidth;
+                const boxPaddingX = 16;
+                const boxPaddingY = 14;
+                const innerX = boxX + boxPaddingX;
+                const innerW = boxW - boxPaddingX * 2;
+                const plannedLines = [
+                    { label: "Aplicável", value: question?.aplicavel ? "Sim" : "Não" },
+                    { label: "Capitulação", value: question?.capitulacao },
+                    {
+                        label: "Criticidade",
+                        value: question?.criticidade != null ? String(question.criticidade) : undefined,
+                    },
+                    { label: "Resposta", value: question?.resposta },
+                    { label: "Resposta (texto)", value: question?.respostaTexto },
+                    { label: "Deficiência", value: question?.deficienciaTexto },
+                    ...(incluirRecomendacoes === "INCLUIR"
+                        ? [{ label: "Recomendação", value: question?.recomendacaoTexto }]
+                        : []),
+                    {
+                        label: "Teste (status)",
+                        value: question?.testStatus != null ? String(question.testStatus) : undefined,
+                    },
+                    { label: "Teste (descrição)", value: question?.testDescription },
+                    { label: "Referência (requisição)", value: question?.requisicaoRef },
+                    { label: "Referência (resposta do teste)", value: question?.respostaTesteRef },
+                    { label: "Referência (amostra)", value: question?.amostraRef },
+                    { label: "Referência (evidências)", value: question?.evidenciasRef },
+                    { label: "Plano de ação (origem)", value: question?.actionOrigem },
+                    { label: "Plano de ação (responsável)", value: question?.actionResponsavel },
+                    { label: "Plano de ação (descrição)", value: question?.actionDescricao },
+                    {
+                        label: "Plano de ação (data apontamento)",
+                        value: safeDate(question?.actionDataApontamento)?.toLocaleDateString("pt-BR"),
+                    },
+                    {
+                        label: "Plano de ação (prazo original)",
+                        value: safeDate(question?.actionPrazoOriginal)?.toLocaleDateString("pt-BR"),
+                    },
+                    {
+                        label: "Plano de ação (prazo atual)",
+                        value: safeDate(question?.actionPrazoAtual)?.toLocaleDateString("pt-BR"),
+                    },
+                    { label: "Plano de ação (comentários)", value: question?.actionComentarios },
+                ]
+                    .filter((lv) => lv.value != null && String(lv.value).trim() !== "")
+                    .map((lv) => ({ label: lv.label, value: String(lv.value) }));
+                const atts = Array.isArray(question?.attachments) ? question.attachments : [];
+                let estimatedHeight = 0;
+                estimatedHeight += boxPaddingY;
+                estimatedHeight += measureTextHeight(`${index + 1}. ${ReportService.sanitizeQuestionTitle(question?.texto)}`, { width: innerW, font: "Helvetica-Bold", fontSize: 12, lineGap: 2 });
+                estimatedHeight += 10;
+                plannedLines.forEach(({ label, value }) => {
+                    estimatedHeight += measureTextHeight(`${label}: ${value || "-"}`, {
+                        width: innerW,
+                        font: "Helvetica",
+                        fontSize: 10,
+                        lineGap: 1,
+                    });
+                    estimatedHeight += 2;
+                });
+                const uniqueAttachmentsForEstimate = Array.from(atts
+                    .reduce((acc, att) => {
+                    acc.set(`${att.category}|${att.path}`, att);
+                    return acc;
+                }, new Map())
+                    .values());
+                if (uniqueAttachmentsForEstimate.length > 0) {
+                    estimatedHeight += 14;
+                    estimatedHeight += measureTextHeight("Arquivos", {
+                        width: innerW,
+                        font: "Helvetica-Bold",
+                        fontSize: 10.5,
+                    });
+                    uniqueAttachmentsForEstimate.forEach((att) => {
+                        estimatedHeight += measureTextHeight(`• [${att.category}] ${att.originalName || att.filename || "Arquivo"}`, { width: innerW, font: "Helvetica", fontSize: 10, lineGap: 2 });
+                        if (att.referenceText) {
+                            estimatedHeight += measureTextHeight(`  Referência: ${att.referenceText}`, { width: innerW - 10, font: "Helvetica", fontSize: 9.5, lineGap: 2 });
+                        }
+                        estimatedHeight += 2;
+                    });
+                }
+                estimatedHeight += boxPaddingY + 10;
+                ensureSpace(Math.ceil(estimatedHeight));
+                const boxY = pdf.y;
+                pdf.y = boxY + boxPaddingY;
+                pdf
+                    .fillColor(textDark)
+                    .font("Helvetica-Bold")
+                    .fontSize(12)
+                    .text(`${index + 1}. ${ReportService.sanitizeQuestionTitle(question?.texto)}`, innerX, pdf.y, { width: innerW, lineGap: 2 });
+                pdf.moveDown(0.4);
+                pdf.fillColor(textMuted).font("Helvetica").fontSize(10);
+                kv("Aplicável", question?.aplicavel ? "Sim" : "Não", innerX, innerW);
+                if (question?.capitulacao)
+                    kv("Capitulação", String(question.capitulacao), innerX, innerW);
+                if (question?.criticidade)
+                    kv("Criticidade", String(question.criticidade), innerX, innerW);
+                if (question?.resposta)
+                    kv("Resposta", String(question.resposta), innerX, innerW);
+                if (question?.respostaTexto)
+                    kv("Resposta (texto)", String(question.respostaTexto), innerX, innerW);
+                if (question?.deficienciaTexto)
+                    kv("Deficiência", String(question.deficienciaTexto), innerX, innerW);
+                if (incluirRecomendacoes === "INCLUIR" && question?.recomendacaoTexto)
+                    kv("Recomendação", String(question.recomendacaoTexto), innerX, innerW);
+                if (question?.testStatus)
+                    kv("Teste (status)", String(question.testStatus), innerX, innerW);
+                if (question?.testDescription)
+                    kv("Teste (descrição)", String(question.testDescription), innerX, innerW);
+                if (question?.requisicaoRef)
+                    kv("Referência (requisição)", String(question.requisicaoRef), innerX, innerW);
+                if (question?.respostaTesteRef)
+                    kv("Referência (resposta do teste)", String(question.respostaTesteRef), innerX, innerW);
+                if (question?.amostraRef)
+                    kv("Referência (amostra)", String(question.amostraRef), innerX, innerW);
+                if (question?.evidenciasRef)
+                    kv("Referência (evidências)", String(question.evidenciasRef), innerX, innerW);
+                if (question?.actionOrigem)
+                    kv("Plano de ação (origem)", String(question.actionOrigem), innerX, innerW);
+                if (question?.actionResponsavel)
+                    kv("Plano de ação (responsável)", String(question.actionResponsavel), innerX, innerW);
+                if (question?.actionDescricao)
+                    kv("Plano de ação (descrição)", String(question.actionDescricao), innerX, innerW);
+                const dAp = safeDate(question?.actionDataApontamento);
+                if (dAp)
+                    kv("Plano de ação (data apontamento)", dAp.toLocaleDateString("pt-BR"), innerX, innerW);
+                const dPo = safeDate(question?.actionPrazoOriginal);
+                if (dPo)
+                    kv("Plano de ação (prazo original)", dPo.toLocaleDateString("pt-BR"), innerX, innerW);
+                const dPa = safeDate(question?.actionPrazoAtual);
+                if (dPa)
+                    kv("Plano de ação (prazo atual)", dPa.toLocaleDateString("pt-BR"), innerX, innerW);
+                if (question?.actionComentarios)
+                    kv("Plano de ação (comentários)", String(question.actionComentarios), innerX, innerW);
+                const uniqueAtts = Array.from(atts
+                    .reduce((acc, att) => {
+                    acc.set(`${att.category}|${att.path}`, att);
+                    return acc;
+                }, new Map())
+                    .values());
+                if (uniqueAtts.length > 0) {
+                    pdf.moveDown(0.4);
+                    pdf
+                        .fillColor(textDark)
+                        .font("Helvetica-Bold")
+                        .fontSize(10.5)
+                        .text("Arquivos", innerX, pdf.y);
+                    pdf.moveDown(0.2);
+                    uniqueAtts.forEach((att) => {
+                        ensureSpace(18);
+                        const link = ReportService.buildBuilderAttachmentLink(att, baseUrl);
+                        pdf
+                            .fillColor(linkColor)
+                            .font("Helvetica")
+                            .fontSize(10)
+                            .text(`• [${att.category}] ${att.originalName || att.filename || "Arquivo"}`, innerX, pdf.y, {
+                            width: innerW,
+                            link,
+                            underline: true,
+                            lineGap: 2,
+                        });
+                        pdf.fillColor(textMuted);
+                        if (att.referenceText) {
+                            pdf
+                                .fillColor(textMuted)
+                                .font("Helvetica")
+                                .fontSize(9.5)
+                                .text(`  Referência: ${att.referenceText}`, innerX + 10, pdf.y, {
+                                width: innerW - 10,
+                                lineGap: 2,
+                            });
+                        }
+                    });
+                }
+                const boxEndY = pdf.y + boxPaddingY;
+                pdf
+                    .strokeColor(lineColor)
+                    .rect(boxX, boxY, boxW, boxEndY - boxY)
+                    .stroke();
+                pdf.y = boxEndY + 10;
+            });
+        });
+        pdf.end();
+        await new Promise((resolve, reject) => {
+            stream.on("finish", () => resolve());
+            stream.on("error", (err) => reject(err));
+        });
+        if ((0, storage_1.getStorageProvider)() === "supabase") {
+            await (0, storage_1.uploadFileToStorage)({
+                localPath: filePath,
+                objectKey: `reports/${filename}`,
+                contentType: "application/pdf",
+                deleteLocal: true,
+            });
+        }
+        const report = await database_1.default.report.create({
+            data: {
+                name: reportName,
+                type: "BUILDER_FORM_USER_REPORT",
+                format: "PDF",
+                content: null,
+                filePath: path_1.default.join("uploads", "reports", filename),
+                userId: requesterUser.id,
+            },
+        });
+        return report;
+    }
+    static async generatePldBuilderReport(userId, format = "DOCX", opts) {
+        const user = await database_1.default.user.findUnique({
+            where: { id: userId },
+            select: { id: true, name: true, email: true },
+        });
         if (!user) {
             throw new Error("Usuário não encontrado");
         }
+        // Builder (ADMIN) usa createdById = null; não misturar seções de outros usuários.
         const sections = await database_1.default.pldSection.findMany({
+            where: { createdById: null },
             include: {
                 attachments: true,
                 questions: {
@@ -117,7 +819,12 @@ class ReportService {
             .replace(/\/+$/, "");
         const generatedAt = new Date().toLocaleString("pt-BR");
         const title = "Relatório PLD";
-        const reportName = `Relatório PLD Builder - ${user.name}`;
+        const introName = (opts?.name || "").trim();
+        const introInstituicoes = Array.isArray(opts?.metadata?.instituicoes)
+            ? opts?.metadata?.instituicoes ?? []
+            : [];
+        const introAvaliador = (opts?.metadata?.qualificacaoAvaliador || "").trim();
+        const reportName = introName ? `Relatório PLD Builder - ${introName}` : `Relatório PLD Builder - ${user.name}`;
         if (format === "DOCX") {
             const filename = `pld-builder-report-${userId}-${timestamp}.docx`;
             const filePath = path_1.default.join(reportsDir, filename);
@@ -138,6 +845,33 @@ class ReportService {
                         new docx_1.TextRun({ text: `Data: ${generatedAt}`, break: 1 }),
                     ],
                 }),
+                new docx_1.Paragraph({ text: "Introdução", heading: docx_1.HeadingLevel.HEADING_1 }),
+                ...(introInstituicoes.length
+                    ? [
+                        new docx_1.Paragraph({
+                            spacing: { after: 120 },
+                            children: [new docx_1.TextRun({ text: "Instituição(ões)", bold: true })],
+                        }),
+                        ...introInstituicoes.map((inst) => new docx_1.Paragraph({
+                            bullet: { level: 0 },
+                            children: [
+                                new docx_1.TextRun({
+                                    text: `${(inst.nome || "-").trim()}${inst.cnpj ? ` (CNPJ: ${inst.cnpj})` : ""}`,
+                                }),
+                            ],
+                        })),
+                    ]
+                    : [
+                        new docx_1.Paragraph({
+                            spacing: { after: 120 },
+                            children: [new docx_1.TextRun({ text: "Instituição(ões): -", bold: true })],
+                        }),
+                    ]),
+                new docx_1.Paragraph({
+                    spacing: { before: 120, after: 120 },
+                    children: [new docx_1.TextRun({ text: "Descrição do avaliador", bold: true })],
+                }),
+                new docx_1.Paragraph({ text: introAvaliador || "-", spacing: { after: 160 } }),
             ];
             sections.forEach((section) => {
                 const sectionLabel = section.customLabel?.trim()
@@ -187,7 +921,7 @@ class ReportService {
                 }
                 (section.questions || []).forEach((question, index) => {
                     const card = [
-                        ReportService.buildDocxCardTitle(`${index + 1}. ${question.texto || "-"}`),
+                        ReportService.buildDocxCardTitle(`${index + 1}. ${ReportService.sanitizeQuestionTitle(question.texto)}`),
                         ReportService.buildLabelValueParagraph("Aplicável", question.aplicavel ? "Sim" : "Não"),
                     ];
                     if (question.capitulacao)
@@ -389,6 +1123,22 @@ class ReportService {
         pdf.text(`Data: ${generatedAt}`, { align: "center" });
         pdf.moveDown(1.0);
         hr();
+        // Introdução
+        h2("Introdução");
+        if (introInstituicoes.length > 0) {
+            h3("Instituição(ões)");
+            introInstituicoes.forEach((inst, idx) => {
+                const nome = (inst.nome || "-").trim() || "-";
+                const cnpj = (inst.cnpj || "").trim();
+                p(`${idx + 1}. ${nome}${cnpj ? ` (CNPJ: ${cnpj})` : ""}`);
+            });
+        }
+        else {
+            p("Instituição(ões): -");
+        }
+        h3("Descrição do avaliador");
+        p(introAvaliador || "-");
+        hr();
         sections.forEach((section, sectionIndex) => {
             if (sectionIndex > 0) {
                 pdf.addPage();
@@ -492,7 +1242,7 @@ class ReportService {
                 const atts = question.attachments || [];
                 let estimatedHeight = 0;
                 estimatedHeight += boxPaddingY; // top padding
-                estimatedHeight += measureTextHeight(`${index + 1}. ${question.texto || "-"}`, {
+                estimatedHeight += measureTextHeight(`${index + 1}. ${ReportService.sanitizeQuestionTitle(question.texto)}`, {
                     width: innerW,
                     font: "Helvetica-Bold",
                     fontSize: 12,
@@ -548,7 +1298,7 @@ class ReportService {
                     .fillColor(textDark)
                     .font("Helvetica-Bold")
                     .fontSize(12)
-                    .text(`${index + 1}. ${question.texto || "-"}`, innerX, pdf.y, {
+                    .text(`${index + 1}. ${ReportService.sanitizeQuestionTitle(question.texto)}`, innerX, pdf.y, {
                     width: innerW,
                     lineGap: 2,
                 });
@@ -665,7 +1415,10 @@ class ReportService {
         return report;
     }
     static async generateUserReport(userId, type = "FULL", format = "PDF", topicIds) {
-        const user = await database_1.default.user.findUnique({ where: { id: userId } });
+        const user = await database_1.default.user.findUnique({
+            where: { id: userId },
+            select: { id: true, name: true, email: true },
+        });
         if (!user) {
             throw new Error("Usuário não encontrado");
         }
@@ -780,7 +1533,7 @@ class ReportService {
                                 topicBlocks.push(new docx_1.Paragraph({ text: "", spacing: { after: 120 } }));
                                 topic.questions.forEach((question, index) => {
                                     const qCard = [
-                                        ReportService.buildDocxCardTitle(`${index + 1}. ${question.title || "-"}`),
+                                        ReportService.buildDocxCardTitle(`${index + 1}. ${ReportService.sanitizeQuestionTitle(question.title)}`),
                                     ];
                                     if (question.description) {
                                         qCard.push(new docx_1.Paragraph({
@@ -1025,7 +1778,7 @@ class ReportService {
                 const boxPaddingY = 14;
                 const innerX = boxX + boxPaddingX;
                 const innerW = boxW - boxPaddingX * 2;
-                const titleText = `${index + 1}. ${question.title || "-"}`;
+                const titleText = `${index + 1}. ${ReportService.sanitizeQuestionTitle(question.title)}`;
                 let estimatedHeight = 0;
                 estimatedHeight += boxPaddingY;
                 estimatedHeight += measureTextHeight(titleText, {

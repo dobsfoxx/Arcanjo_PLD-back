@@ -4,10 +4,13 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "dev": "nodemon --watch src --ext ts --exec ts-node src/app.ts",
+    "predev": "prisma generate",
+    "dev": "nodemon --watch src --ext ts --exec tsx src/app.ts",
     "start": "node dist/app.js",
+    "prebuild": "prisma generate",
     "build": "tsc",
     "prisma:generate": "prisma generate",
+    "postinstall": "prisma generate",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
@@ -22,10 +25,12 @@
     "@supabase/supabase-js": "^2.57.0",
     "@types/pdfkit": "^0.17.4",
     "bcryptjs": "^3.0.3",
+    "cookie-parser": "^1.4.7",
     "cors": "^2.8.5",
     "docx": "^9.5.1",
     "dotenv": "^17.2.3",
     "express": "^5.2.1",
+    "google-auth-library": "^10.5.0",
     "helmet": "^8.1.0",
     "joi": "^18.0.2",
     "jsonwebtoken": "^9.0.3",
@@ -33,10 +38,12 @@
     "multer": "^2.0.2",
     "nodemailer": "^6.9.15",
     "pdfkit": "^0.17.2",
-    "prisma": "^6.0.0"
+    "prisma": "^6.0.0",
+    "stripe": "^20.1.1"
   },
   "devDependencies": {
     "@types/bcryptjs": "^2.4.6",
+    "@types/cookie-parser": "^1.4.10",
     "@types/cors": "^2.8.19",
     "@types/express": "^5.0.6",
     "@types/jsonwebtoken": "^9.0.10",
@@ -48,6 +55,7 @@
     "http-server": "^14.1.1",
     "nodemon": "^3.1.11",
     "ts-node": "^10.9.2",
+    "tsx": "^4.20.0",
     "typescript": "^5.9.3"
   }
 }
