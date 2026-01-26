@@ -1,0 +1,540 @@
+DOCUMENTAÇÃO FRONTEND (GRANULAR) — Sistema Arcanjo PLD
+
+Objetivo
+- Este documento descreve o frontend (Vite + React) no nível “arquivo / funções / handlers”.
+- Foco no fluxo do novo PLD Builder (ADMIN/TRIAL_ADMIN) e no fluxo de preenchimento pelo usuário final (USER).
+- O frontend conversa com o backend via Axios (frontend/src/lib/api.ts) usando:
+  - Authorization: Bearer <token> (armazenado em localStorage como "pld_token")
+  - withCredentials=true (para cookie HttpOnly em paralelo)
+
+
+============================================================
+1) ENTRYPOINTS E ESTRUTURA DE ROTEAMENTO
+============================================================
+
+1.1) frontend/src/main.tsx
+- Monta a árvore React.
+- Providers de tema (MUI + Joy) e CssBaseline.
+- GoogleOAuthProvider é incluído apenas se VITE_GOOGLE_CLIENT_ID existir.
+
+Fluxo:
+- ReactDOM.createRoot(...).render(
+    <ThemeProvider>
+      <JoyCssVarsProvider>
+        <CssBaseline />
+        (GoogleOAuthProvider opcional)
+        <App />
+      </JoyCssVarsProvider>
+    </ThemeProvider>
+  )
+
+
+1.2) frontend/src/App.tsx
+Responsabilidade:
+- Define rotas (react-router-dom) e “guards” de acesso.
+- Envelopa a aplicação com <AuthProvider> e <PldCatalogProvider>.
+
+Guards:
+- ProtectedRoute: exige sessão (user != null). Enquanto loading, mostra loader.
+- AdminRoute: exige user.role === 'ADMIN'. Caso contrário redireciona.
+- BuilderRoute:
+  - exige sessão
+  - permite entrar se user.role === 'ADMIN' OU user.role === 'TRIAL_ADMIN' OU subscriptionStatus === 'ACTIVE'
+  - se não tem acesso, redireciona para /payment
+
+Componente HomeRedirect:
+- Se não logado: /login
+- Se ADMIN: /admin/forms
+- Se TRIAL_ADMIN ou assinatura ACTIVE: /pld-builder
+- Caso contrário: /my-forms
+
+Rotas principais:
+- /login, /forgot-password, /reset-password
+- /payment
+- /profile
+- /pld-builder (BuilderRoute)
+- /admin/forms e /admin/forms/:id (BuilderRoute)
+- /my-forms, /forms/:id (ProtectedRoute)
+- fallback: NotFoundPage
+
+
+============================================================
+2) CAMADA DE AUTENTICAÇÃO (CONTEXT) E SESSÃO
+============================================================
+
+2.1) frontend/src/contexts/auth-context.ts
+- Define o tipo AuthContextValue:
+  - user, token, loading
+  - login(email, password)
+  - register(name, email, password, opts? { startTrial? })
+  - logout()
+
+
+2.2) frontend/src/contexts/AuthProvider.tsx
+Responsabilidade:
+- Fonte de verdade do usuário logado no client.
+- Mantém token em estado + localStorage (best-effort) e sincroniza com Axios.
+
+Funções auxiliares:
+- safeGetStoredToken(): lê localStorage("pld_token") de forma segura.
+- safeSetStoredToken(token): grava/remove "pld_token" no localStorage.
+
+Fluxo principal (useEffect dependente de token):
+- Ao mudar token:
+  - setClientAuthToken(token) => seta header default no axios client.
+  - chama authApi.me() para obter user.
+  - em falha, limpa token local.
+
+Métodos expostos:
+- login(email, password):
+  - chama authApi.login
+  - seta user/token
+  - salva token localStorage e no axios defaults
+- register(name, email, password, {startTrial}):
+  - chama authApi.register
+  - seta user/token e persiste token
+- logout():
+  - chama authApi.logout() (best-effort)
+  - zera user/token e limpa localStorage
+
+Observação:
+- O cookie HttpOnly é gerenciado pelo backend. O client mantém um token no localStorage principalmente para anexar Authorization e baixar blobs.
+
+
+2.3) frontend/src/contexts/useAuth.ts
+- Hook de conveniência: useContext(AuthContext)
+- Lança erro se chamado fora do AuthProvider.
+
+
+============================================================
+3) CATÁLOGO DE ITENS PLD (LISTA FIXA)
+============================================================
+
+3.1) frontend/src/contexts/PldCatalogProvider.tsx
+- Exponibiliza itemOptions (lista de “Itens avaliados”) vindos de PLD_ITEM_OPTIONS.
+
+3.2) frontend/src/contexts/usePldCatalog.ts
+- Hook para acessar itemOptions.
+
+
+============================================================
+4) CLIENT HTTP E ENDPOINTS (AXIOS)
+============================================================
+
+4.1) frontend/src/lib/api.ts
+Responsabilidade:
+- Cria o client axios (api) com baseURL em VITE_API_URL, garantindo sufixo /api.
+- Interceptor request:
+  - lê token do localStorage (safeGetStoredToken)
+  - injeta Authorization: Bearer <token>
+  - força withCredentials=true
+  - faz log no console: [API] METHOD URL
+- Interceptor response: loga erro e repassa Promise.reject
+
+APIs expostas (seleção de rotas relevantes):
+
+Auth:
+- authApi.login -> POST /auth/login
+- authApi.register -> POST /auth/register
+- authApi.me -> GET /auth/me
+- authApi.updateMe -> PATCH /auth/me
+- authApi.logout -> POST /auth/logout
+- forgot/reset/google (existem no arquivo; usadas em páginas específicas)
+
+Billing:
+- billingApi.me -> GET /billing/me
+- billingApi.checkout -> POST /billing/checkout
+- billingApi.portal -> POST /billing/portal
+
+Reports:
+- reportApi.generatePldBuilderReport -> POST /report/pld-builder?format=PDF|DOCX
+- reportApi.generateMyBuilderFormReport -> GET/POST (dependendo do wrapper) para /report/forms/:id?format=...
+
+PLD Builder:
+- pldBuilderApi.listSections -> GET /pld/sections
+- pldBuilderApi.createSection/updateSection/deleteSection/reorderSections
+- pldBuilderApi.createQuestion/updateQuestion/deleteQuestion/reorderQuestions
+- uploadNorma (por seção)
+- uploadAttachment (por pergunta; categorias RESPOSTA/DEFICIENCIA/TESTE_*)
+- resetBuilder -> POST /pld/reset
+- concludeBuilder -> POST /pld/conclude
+- listConcludedForms -> GET /pld/forms
+- sendFormToUser -> POST /pld/forms/:id/send
+- listMyForms -> GET /pld/my-forms
+- getUserForm -> GET /pld/forms/:id/user
+- saveUserFormResponses -> POST /pld/forms/:id/responses
+- uploadUserFormAttachment -> POST /pld/forms/:id/upload
+- completeUserForm -> POST /pld/forms/:id/complete
+
+
+============================================================
+5) COMPONENTES REUTILIZÁVEIS IMPORTANTES
+============================================================
+
+5.1) frontend/src/components/FileUpload.tsx
+Responsabilidade:
+- Componente genérico de upload com suporte a:
+  - single ou multiple
+  - maxFiles (default 5)
+  - área clicável + teclado
+  - lista de arquivos selecionados com remover
+- Reset do input file após seleção permite escolher o mesmo arquivo novamente.
+
+Pontos práticos:
+- O componente gerencia apenas seleção local. O upload real ocorre nas páginas (ex: PLDBuilderPage, UserSubmissionsPage).
+
+
+5.2) frontend/src/components/QuestionCard.tsx
+Responsabilidade:
+- Renderiza uma questão (admin/builder) com campos e anexos.
+- Suporta expand/collapse.
+
+Lógica de persistência:
+- handleSave(): valida, chama onPersist() e marca respondida=true se ok.
+
+Uploads:
+- Usa FileUpload para categorias diferentes:
+  - anexos de resposta, deficiência
+  - anexos do teste (requisição/resposta/amostra/evidências)
+- Regras específicas (ex): quando test.status === 'SIM' exige anexos do teste; NAO_PLANO altera UI para comentários.
+
+
+5.3) frontend/src/components/SectionSidebar.tsx
+Responsabilidade:
+- Sidebar “Itens avaliados” (seções).
+- Seleção por activeId.
+- Botões para deletar/selecionar/adicionar item.
+- Flags canEdit/canAdd determinam se habilita ações.
+
+
+5.4) frontend/src/components/ProgressDashBoard.tsx
+- Exibe resumo de progresso (respondidas/aplicáveis).
+- Usado em PLDBuilderPage e UserSubmissionsPage.
+
+
+============================================================
+6) PÁGINAS — FLUXOS PRINCIPAIS
+============================================================
+
+6.1) frontend/src/pages/LoginPage.tsx
+Responsabilidade:
+- Tela login/registro.
+- No modo register, permite startTrial (checkbox).
+
+Fluxo:
+- handleSubmit:
+  - chama useAuth().login ou useAuth().register
+  - após sucesso, redireciona por role/entitlement (padrão parecido com HomeRedirect)
+
+
+6.2) frontend/src/pages/PaymentPage.tsx
+Responsabilidade:
+- Exibe status de cobrança/entitlements.
+- Botões para iniciar checkout ou abrir portal Stripe.
+
+Fluxo:
+- onMount: billingApi.me()
+- checkout: billingApi.checkout()
+- portal: billingApi.portal()
+
+
+6.3) frontend/src/pages/ProfilePage.tsx
+Responsabilidade:
+- Atualização de nome (PATCH /auth/me).
+- Mostra status (Admin / Trial / Licença ativa).
+
+
+6.4) frontend/src/pages/UserFormsPage.tsx
+Responsabilidade:
+- Lista formulários atribuídos ao usuário (pldBuilderApi.listMyForms).
+- Navega para /forms/:id (UserSubmissionsPage).
+
+
+6.5) frontend/src/pages/UserSubmissionsPage.tsx (fluxo do USER)
+Responsabilidade:
+- Carrega um formulário “atribuído” ao usuário.
+- Permite responder questões, anexar evidências e concluir.
+
+Estrutura de estado (alto nível):
+- loadForm(): chama pldBuilderApi.getUserForm(formId)
+- Mantém respostas e anexos localmente, inclusive filas de uploads pendentes.
+- Metadados obrigatórios (instituições, CNPJ, qualificação do avaliador).
+
+Ponto arquitetural crítico (comentado no código):
+- uploadPendingFiles(): faz upload SEQUENCIAL (um arquivo por vez).
+  Motivo: no backend, anexos do usuário são persistidos dentro do JSON do Report.content.
+  Se uploads ocorrerem em paralelo, pode ocorrer “last-write-wins” e sobrescrever anexos previamente inseridos.
+
+Fluxo salvar:
+- handleSave():
+  - valida metadados
+  - chama uploadPendingFiles() (sequencial)
+  - monta payload answers + sections + metadata
+  - chama pldBuilderApi.saveUserFormResponses(formId, payload)
+  - recarrega silenciosamente
+
+Fluxo gerar relatório:
+- handleGenerateReport():
+  - salva antes
+  - chama reportApi.generateMyBuilderFormReport(formId, format)
+  - baixa via signedUrl (se existir) ou via /uploads + axios blob + token
+
+Fluxo concluir:
+- handleCompleteForm():
+  - exige progresso 100%
+  - salva
+  - chama pldBuilderApi.completeUserForm(formId)
+
+
+============================================================
+7) PLDBuilderPage (ADMIN/TRIAL_ADMIN) — DETALHADO
+============================================================
+
+Arquivo: frontend/src/pages/PLDBuilderPage.tsx
+Responsabilidade:
+- UI principal de construção do “template” do relatório (seções + perguntas + anexos).
+- Também concentra ações de:
+  - autosave com deduplicação
+  - geração de relatório “preview” (ADMIN)
+  - concluir e salvar formulário (gera snapshot e limpa builder)
+  - iniciar novo formulário via query param openConclude=1
+  - editar um formulário existente via query param editFormId
+
+
+7.1) Controle de acesso no client (canEdit/trial)
+- canEdit = ADMIN || subscriptionActive || trialActive
+- trialActive é computado por:
+  - role TRIAL_ADMIN ou user.isTrial
+  - trialExpiresAt > Date.now()
+
+Limites no modo teste (frontend):
+- TRIAL_MAX_SECTIONS = 3
+- TRIAL_MAX_QUESTIONS = 3
+- canAddSection/canAddQuestion bloqueiam UI e exibem toast.
+
+
+7.2) loadSections(): carregar estado do builder do backend
+- Chama pldBuilderApi.listSections() (GET /pld/sections).
+- Se o backend retornar lista vazia:
+  - reset completo do estado local (cria makeEmptySection(defaultItem))
+  - limpa refs:
+    - initialSectionIdsRef / initialQuestionIdsRef
+    - lastPersistedSectionPayloadRef / lastPersistedQuestionPayloadRef
+    - lastPersistedSectionOrderRef / lastPersistedQuestionOrderRef
+    - uploadedFilesRef (cache de “já fiz upload deste File”)
+    - changeCounterRef / lastSavedCounterRef
+  - cancela autosave timer
+  - evita falha de “salvar com ids antigos” após /reset
+
+Quando há seções:
+- Ordena por order e mapeia via mapApiSectionToState.
+- Ajusta activeSectionId para um id válido.
+- Sanitiza expandedQuestions: remove ids que não existem mais no backend.
+- Semeia “snapshots” de persistência:
+  - lastPersistedSectionPayloadRef: Map<sectionId, JSON string>
+  - lastPersistedQuestionPayloadRef: Map<questionId, JSON string>
+  - lastPersistedSectionOrderRef: string[] (ordem)
+  - lastPersistedQuestionOrderRef: Map<sectionId, string[]> (ordem por seção)
+
+
+7.3) Edição de formulário existente (editFormId)
+useEffect:
+- Se houver ?editFormId=<id>:
+  - pldBuilderApi.getConcludedForm(id)
+  - mapeia form.sections para o formato do builder e injeta em state
+  - seta editFormName(form.name)
+
+Observação importante:
+- Esse fluxo carrega seções/questões a partir do “form concluído” (snapshot). Isso é diferente de listSections() que carrega o builder “vivo”.
+
+
+7.4) Modelo de autosave
+Variáveis/refs-chave:
+- sectionsRef: sempre aponta para o estado mais recente (evita closure stale).
+- changeCounterRef: incrementa a cada alteração local.
+- lastSavedCounterRef: marca o contador no último save efetivo.
+- autosaveTimerRef: debounce de 350ms.
+- persistPromiseRef: garante “apenas um persist por vez”.
+
+markDirtyAndScheduleAutosave():
+- Incrementa changeCounterRef.
+- Debounce 350ms e chama persistBuilder({ silent: true, reload: false, setBusy: false }).
+- Só dispara se:
+  - canEdit
+  - não está loading/concluding
+
+Eventos extra para salvar:
+- beforeunload: tenta salvar best-effort e bloqueia unload com prompt.
+- visibilitychange: se aba ficar hidden, tenta salvar best-effort.
+
+
+7.5) Atualização de estado local (CRUD no client)
+- updateSection(partial): patch na seção ativa + schedule autosave.
+- addSection(): adiciona makeEmptySection e torna ativa.
+- addQuestion(): adiciona makeEmptyQuestion, expande a pergunta, schedule autosave.
+- updateQuestion(qId, patch): patch na questão da seção ativa.
+- updateQuestionSync(qId, patch): usa flushSync para garantir ordem (útil quando outro handler depende do estado imediatamente).
+- deleteQuestionLocal(qId): remove e colapsa.
+- deleteSectionLocal(sectionId): confirma com window.confirm, remove; se ficar vazio cria seção fresh.
+- moveQuestion(qId, direction): reorder local.
+
+
+7.6) persistBuilder(opts) — sincronização com backend (a parte mais importante)
+Objetivo:
+- Persistir o snapshot local (sectionsSnapshot = sectionsRef.current) no backend.
+- Resolver ids temporários (temp) criando registros e mapeando id local -> id remoto.
+- Evitar update “em loop” usando lastPersisted* payload snapshots.
+
+Concorrência:
+- Se persistPromiseRef.current existe:
+  - aguarda o persist atual
+  - se ainda há mudanças (changeCounter != lastSavedCounter), roda persistBuilder de novo
+
+Passos por seção:
+1) Seção
+- Se id temporário:
+  - createSection(createPayload) => obtém sectionId remoto
+  - salva mapping sectionIdMap
+- Se id real:
+  - compara JSON.stringify(updatePayload) com lastPersistedSectionPayloadRef
+  - se mudou: updateSection(id)
+
+2) Upload de NORMA (por seção)
+- Se section.hasNorma && section.normaFile:
+  - para cada arquivo (max 5):
+    - se “já foi enviado” (uploadedFilesRef via fileKey) -> pula
+    - uploadNorma(sectionId, file)
+
+3) Perguntas
+- Se id temporário:
+  - createQuestion(sectionId, texto)
+  - salva mapping questionIdMap
+- Monta qPayload completo (texto/aplicável/respondida, campos de teste, plano de ação, etc.)
+- Dedup de update:
+  - JSON.stringify(qPayload) comparado com lastPersistedQuestionPayloadRef
+  - se mudou: updateQuestion(qId)
+
+4) Upload de anexos (por pergunta)
+- Para cada categoria (resposta/deficiência/teste_*):
+  - max 5
+  - usa uploadedFilesRef para evitar re-upload em autosaves repetidos
+  - chama uploadAttachment(qId, file, category, referenceText?)
+
+5) Reorder
+- Reordena perguntas por seção: reorderQuestions(sectionId, [qIds]) apenas se a ordem mudou.
+- Reordena seções: reorderSections([sectionIds]) apenas se a ordem mudou.
+
+6) Deleções
+- Perguntas removidas localmente:
+  - compara com initialQuestionIdsRef (estado inicial vindo do backend)
+  - deleta as que sumiram: deleteQuestion(id)
+- Seções removidas:
+  - compara initialSectionIdsRef com currentRemoteIds
+  - deleteSection(id)
+
+7) Pós-save
+- Se opts.reload (default true): loadSections() para refletir o backend e repovoar snapshots.
+- Senão:
+  - aplica mapping temp->remoto no estado local sem resetar inputs/arquivos
+  - atualiza initialSectionIdsRef/initialQuestionIdsRef
+  - commit dos lastPersisted* refs
+
+Toasts:
+- Se opts.silent não for true: toast.success("Builder salvo com sucesso")
+- Em erro: toast.error(...) com id fixo 'pld-builder-save-error' para não spammar.
+
+
+7.7) Geração de relatório (preview do builder)
+handleGenerateReport():
+- persistBuilder({silent:true, reload:true})
+- reportApi.generatePldBuilderReport(reportFormat, { name, metadata })
+- Baixa via:
+  - signedUrl -> fetch -> blob -> download
+  - fallback: monta url via api.defaults.baseURL (remove /api) + res.data.url
+    e baixa com axios blob usando token Authorization
+
+
+7.8) Conclusão / envio (modal)
+openConcludeModal():
+- Inicializa instituicoes se vazio
+- Abre modal
+
+Query param openConclude=1:
+- Marca initialSetupMode=true
+- resetBuilder() + loadSections() e depois openConcludeModal()
+- Remove a query da URL (navigate replace)
+
+confirmConcludeReport():
+- Valida:
+  - name
+  - pelo menos 1 instituição
+  - cada instituição: nome + CNPJ com 14 dígitos
+  - qualificação do avaliador
+- Chama pldBuilderApi.concludeBuilder({
+    name,
+    sentToEmail,
+    metadata: { instituicoes, qualificacaoAvaliador, mostrarMetodologia, incluirRecomendacoes }
+  })
+- Fecha modal, limpa campos e navega /admin/forms
+
+Envio de formulário (modal separado):
+confirmSendForm():
+- Valida name e email
+- Fluxo:
+  1) concludeBuilder({ name, sentToEmail: email, helpTexts })
+  2) se retornar formId: sendFormToUser(formId, email, helpTexts)
+  3) navega /admin/forms
+
+Observação:
+- Esse fluxo “concluir + enviar” é propositalmente em 2 passos porque:
+  - concludeBuilder cria o snapshot do formulário (Report)
+  - sendFormToUser muda status para SENT_TO_USER e anexa helpTexts se necessário
+
+
+============================================================
+8) PÁGINAS ADMIN — LISTAGEM E DETALHE
+============================================================
+
+8.1) frontend/src/pages/AdminFormsPage.tsx
+Responsabilidade:
+- Lista formulários concluídos (pldBuilderApi.listConcludedForms).
+- Ações típicas:
+  - ver detalhes
+  - baixar relatório
+  - enviar ao usuário
+  - aprovar/devolver
+  - deletar
+
+Download:
+- Tenta signedUrl primeiro.
+- Caso contrário baixa via axios blob com Authorization.
+
+Observação de comportamento:
+- Há um ponto que pode duplicar chamadas de envio (um envio sem helpTexts e outro com helpTexts) dependendo do trecho usado. Se isso for relevante para você, vale revisar o handler confirmSendToUser do arquivo.
+
+
+8.2) frontend/src/pages/AdminFormDetailPage.tsx
+- Carrega um form concluído por id (getConcludedForm).
+- Renderiza snapshot (seções/questões/anexos).
+- Se status IN_PROGRESS/SENT_TO_USER pode oferecer editar no builder.
+
+
+============================================================
+9) ONDE OLHAR QUANDO ALGO “DÁ RUIM”
+============================================================
+
+- "Builder salva sem parar":
+  - conferir markDirtyAndScheduleAutosave + lastSavedCounterRef
+  - conferir persistPromiseRef (se não está travando)
+
+- "Arquivos sobem repetidamente":
+  - conferir uploadedFilesRef/fileKey e se o objeto File muda (nome/tamanho/lastModified)
+
+- "Depois de reset, salvar falha":
+  - o loadSections já tem um bloco específico para limpar estado local quando apiSections.length === 0
+
+- "Usuário perde anexos":
+  - no fluxo USER, uploads precisam ser sequenciais (UserSubmissionsPage.uploadPendingFiles)
+
+
+FIM

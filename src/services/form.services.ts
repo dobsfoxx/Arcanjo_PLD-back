@@ -433,38 +433,20 @@ export class FormService {
   
   // Calcular progresso geral
   static async calculateProgress(userId: string) {
-    const topics = await (prisma as any).topic.findMany({
-      where: { isActive: true },
-      include: {
-        questions: {
-          include: {
-            answers: {
-              where: { userId },
-            },
-          },
+    const [totalQuestions, totalApplicable, totalAnswered] = await Promise.all([
+      prisma.question.count({
+        where: { topic: { isActive: true } },
+      }),
+      prisma.question.count({
+        where: { isApplicable: true, topic: { isActive: true } },
+      }),
+      prisma.answer.count({
+        where: {
+          userId,
+          question: { isApplicable: true, topic: { isActive: true } },
         },
-      },
-    })
-
-    const topicList = (topics as any[]) || []
-
-    let totalApplicable = 0
-    let totalAnswered = 0
-    let totalQuestions = 0
-
-    for (const topic of topicList) {
-      const questions = (topic.questions as any[]) || []
-      totalQuestions += questions.length
-
-      for (const question of questions) {
-        if (question.isApplicable) {
-          totalApplicable++
-          if (question.answers && question.answers.length > 0) {
-            totalAnswered++
-          }
-        }
-      }
-    }
+      }),
+    ])
 
     const progress = totalApplicable > 0
       ? Math.round((totalAnswered / totalApplicable) * 100)
@@ -482,37 +464,35 @@ export class FormService {
   static async calculateTopicProgress(topicId: string, userId: string) {
     const topic = await (prisma as any).topic.findUnique({
       where: { id: topicId },
-      include: {
-        questions: {
-          include: {
-            answers: {
-              where: { userId },
-            },
-          },
-        },
-      },
+      select: { id: true, name: true },
     })
-    
+
     if (!topic) {
       throw new Error('Tópico não encontrado')
     }
-    
-    const applicableQuestions = (topic.questions as any[]).filter((q: any) => q.isApplicable)
-    const answeredQuestions = applicableQuestions.filter(
-      (q: any) => q.answers && q.answers.length > 0
-    )
-    
-    const progress = applicableQuestions.length > 0
-      ? Math.round((answeredQuestions.length / applicableQuestions.length) * 100)
+
+    const [totalQuestions, applicableCount, answeredCount] = await Promise.all([
+      prisma.question.count({ where: { topicId } }),
+      prisma.question.count({ where: { topicId, isApplicable: true } }),
+      prisma.answer.count({
+        where: {
+          userId,
+          question: { topicId, isApplicable: true },
+        },
+      }),
+    ])
+
+    const progress = applicableCount > 0
+      ? Math.round((answeredCount / applicableCount) * 100)
       : 0
-    
+
     return {
       topicId: topic.id,
       topicName: topic.name,
       progress,
-      applicableCount: applicableQuestions.length,
-      answeredCount: answeredQuestions.length,
-      totalQuestions: (topic.questions as any[]).length
+      applicableCount,
+      answeredCount,
+      totalQuestions,
     }
   }
   

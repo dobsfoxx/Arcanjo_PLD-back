@@ -1,0 +1,342 @@
+DOCUMENTAÇÃO BACKEND (GRANULAR) — Sistema Arcanjo PLD
+
+Objetivo
+- Descrever o backend (Node.js + TypeScript + Express + Prisma/Postgres) no nível “arquivo / rota / função / regras”.
+- Foco no novo PLD Builder e no fluxo de formulários atribuídos ao usuário.
+
+
+============================================================
+1) BOOTSTRAP DA APLICAÇÃO
+============================================================
+
+1.1) src/app.ts
+Responsabilidade:
+- Configuração do Express (middlewares, rotas e handler de erros).
+
+Pontos importantes do setup:
+- CORS com allowlist via env (origens permitidas).
+- cookie-parser para ler cookie pld_token.
+- rota especial do webhook Stripe:
+  - /api/billing/webhook usa body raw (necessário para validação de assinatura Stripe).
+- rotas principais:
+  - /api/auth  -> src/routes/auth.routes.ts
+  - /api/form  -> src/routes/form.routes.ts
+  - /api/report -> src/routes/report.routes.ts
+  - /api/pld   -> src/routes/pldBuilder.routes.ts
+  - /api/billing -> src/routes/billing.routes.ts
+
+Serviço de arquivos em /uploads:
+- GET /uploads/*path é protegido por authenticateFromHeaderOrQuery.
+- Se o storage provider for supabase, pode retornar redirect para signedUrl.
+- Caso contrário, serve arquivo local.
+
+Error handler:
+- Retorna JSON.
+- Trata explicitamente erros do Multer (limite de arquivos, tamanho etc).
+
+
+============================================================
+2) AUTENTICAÇÃO E AUTORIZAÇÃO
+============================================================
+
+2.1) src/middleware/auth.ts
+Responsabilidade:
+- JWT (assinatura/verificação) e middlewares de autenticação.
+
+Funções principais:
+- signToken(userId): cria JWT com expiração (env JWT_EXPIRES_IN; default 8h).
+- authenticate(req,res,next):
+  - extrai token do request
+  - decodifica e valida
+  - carrega usuário no Prisma
+  - anexa req.user
+
+Extração do token (importante para downloads):
+- getTokenFromRequest():
+  - Authorization: Bearer <token>
+  - cookies: pld_token ou auth_token
+- authenticateFromHeaderOrQuery(): variação que permite token em header e/ou query (usado em /uploads).
+
+Regras de role:
+- requireAdmin: exige req.user.role === 'ADMIN'
+- requireBuilderAccess:
+  - ADMIN: sempre permite
+  - TRIAL_ADMIN: permite apenas se trial estiver ativo; senão 403 (code TRIAL_EXPIRED)
+  - assinatura ACTIVE (subscriptionStatus + subscriptionExpiresAt válido): permite
+  - caso contrário: 403 (code PAYMENT_REQUIRED)
+
+Observação:
+- O frontend usa tanto cookie HttpOnly quanto Authorization header, então o backend precisa aceitar ambos (o middleware já aceita).
+
+
+============================================================
+3) PRISMA / MODELOS E ESTRUTURA DE DADOS
+============================================================
+
+3.1) prisma/schema.prisma
+Modelos relevantes para o fluxo atual:
+
+User:
+- role: ADMIN / TRIAL_ADMIN / USER
+- trialExpiresAt + isTrial
+- subscriptionStatus + subscriptionExpiresAt
+
+Report:
+- É usado para relatórios “antigos” e também para o novo builder.
+- No PLD Builder, existem dois usos principais:
+  1) BUILDER_FORM (snapshot do formulário criado pelo admin/trial)
+  2) Formulário atribuído ao usuário (também usando Report.content JSON)
+- Campos importantes:
+  - type (ex: BUILDER_FORM)
+  - status (FormStatus: IN_PROGRESS / SENT_TO_USER / COMPLETED / APPROVED / RETURNED etc)
+  - content (string JSON) => aqui é onde o sistema guarda snapshot + respostas do usuário
+  - assignedToEmail (no fluxo de envio ao usuário)
+
+PldSection / PldQuestion / PldAttachment:
+- Representam o “builder vivo” (template em edição), separado do snapshot.
+- Multi-tenant por createdById:
+  - ADMIN usa createdById = null (escopo do admin)
+  - TRIAL_ADMIN/assinantes usam createdById = userId
+
+Conclusão importante:
+- Builder “em edição” -> tabelas PldSection/PldQuestion/PldAttachment.
+- Formulário concluído / enviado ao usuário -> snapshot JSON dentro de Report.content.
+
+
+============================================================
+4) ROTAS DE AUTH
+============================================================
+
+4.1) src/routes/auth.routes.ts
+Principais endpoints:
+- POST /auth/register
+  - suporta startTrial (cria TRIAL_ADMIN por 3 dias, conforme service)
+  - seta cookie HttpOnly pld_token
+  - retorna { token, user }
+- POST /auth/login
+  - valida credenciais
+  - seta cookie e retorna token+user
+- POST /auth/bootstrap-admin
+  - cria o primeiro ADMIN se ainda não existir
+- GET /auth/me (authenticate)
+- PATCH /auth/me (authenticate)
+- POST /auth/logout (authenticate)
+- rotas de forgot/reset/google (existem no projeto)
+
+
+4.2) src/services/auth.service.ts
+Pontos principais:
+- login():
+  - valida usuário e senha (bcrypt)
+  - se usuário inativo: bloqueia
+  - se trial expirou: rebaixa para USER (atualiza no banco)
+  - retorna token
+- registerUser():
+  - cria usuário
+  - se startTrial: role TRIAL_ADMIN + trialExpiresAt
+- bootstrapAdmin():
+  - garante que não existe ADMIN prévio
+  - senha mínima maior (>= 10)
+
+Observação de comportamento:
+- Existe login via Google no projeto; em muitos projetos esse fluxo exige validação robusta do token (assinatura/audience). Se você for usar em produção, vale revisar cuidadosamente o trecho do service.
+
+
+============================================================
+5) BILLING / STRIPE
+============================================================
+
+5.1) src/routes/billing.routes.ts
+- /billing/me: retorna entitlements/status
+- /billing/checkout: cria sessão checkout
+- /billing/portal: cria sessão portal
+- /billing/webhook: endpoint raw-body (em app.ts)
+
+5.2) src/services/billing.service.ts
+- Integra com Stripe.
+- Atualiza subscriptionStatus e subscriptionExpiresAt via webhooks.
+
+
+============================================================
+6) REPORTS (GERAÇÃO E DOWNLOAD)
+============================================================
+
+6.1) src/routes/report.routes.ts
+Casos relevantes:
+- GET /report/me (relatório do usuário; não é o builder)
+- GET /report/forms/:id
+  - gera relatório baseado em um “form concluído” (BUILDER_FORM / status etc)
+- GET/POST /report/pld-builder (ADMIN)
+  - gera relatório diretamente do builder “vivo” (sem persistir como form)
+  - retorna { url, downloadUrl, signedUrl }
+
+Download:
+- url normalmente aponta para /uploads/... (servido por src/app.ts).
+- signedUrl existe quando storage provider é supabase.
+
+6.2) src/services/reportServices.ts
+- Contém a lógica grande de geração de DOCX/PDF.
+- Também aplica regras de permissão (ADMIN, TRIAL_ADMIN dono, USER assignedToEmail).
+
+
+============================================================
+7) PLD BUILDER — ROTAS E SERVICE (NÚCLEO DO SISTEMA)
+============================================================
+
+7.1) src/routes/pldBuilder.routes.ts
+Organização por blocos:
+
+A) Builder vivo (ADMIN/TRIAL_ADMIN/assinante) — CRUD
+- GET  /pld/sections
+- POST /pld/sections
+- PATCH/DELETE /pld/sections/:id
+- POST /pld/sections/reorder
+
+- POST /pld/sections/:id/norma (upload norma)
+
+- POST /pld/sections/:id/questions
+- PATCH/DELETE /pld/questions/:id
+- POST /pld/sections/:id/questions/reorder
+
+- POST /pld/questions/:id/attachments (upload por pergunta)
+- DELETE /pld/attachments/:id
+
+B) Lifecycle do builder
+- POST /pld/reset
+  - “limpa builder” (internamente chama PldBuilderService.concludeBuilder(actor))
+
+C) Concluir e salvar formulário
+- POST /pld/conclude
+  - cria snapshot (Report) do builder e limpa as tabelas do builder
+  - recebe { name, sentToEmail?, helpTexts?, metadata? }
+
+D) Gestão de formulários (ADMIN)
+- GET /pld/forms (lista forms concluídos)
+- GET /pld/forms/:id (ver form concluído)
+- DELETE /pld/forms/:id
+- POST /pld/forms/:id/send (enviar ao usuário e mudar status)
+- POST /pld/forms/:id/approve
+- POST /pld/forms/:id/return
+
+E) Fluxo do usuário final (USER)
+- GET  /pld/my-forms (lista forms atribuídos ao email do usuário logado)
+- GET  /pld/forms/:id/user (carrega o snapshot “user form”)
+- POST /pld/forms/:id/responses (salva respostas)
+- POST /pld/forms/:id/upload (upload de anexos no formulário do usuário)
+- POST /pld/forms/:id/complete (marca como COMPLETED após validação 100%)
+
+
+7.2) src/services/pldBuilder.service.ts
+Este arquivo é o coração do “novo builder”.
+
+Conceitos base:
+- ensureBuilderAccess(actor): aplica regra de acesso (ADMIN / TRIAL ativo / assinatura ativa).
+- getScopeWhere(actor):
+  - ADMIN -> { createdById: null }
+  - outros -> { createdById: actor.id }
+  Isso implementa o multi-tenant do builder vivo.
+
+
+7.2.1) Builder vivo (tabelas)
+- listSections(actor): retorna seções do escopo, com perguntas e anexos.
+- createSection/updateSection/deleteSection/reorderSections
+- createQuestion/updateQuestion/deleteQuestion/reorderQuestions
+
+Uploads no builder vivo:
+- addAttachment({ sectionId? / questionId?, category, file, referenceText? })
+  - valida permissão de escrita no recurso
+  - limita capacidade por categoria (remove mais antigos)
+  - salva filePath relativo em uploads
+
+- deleteAttachment(actor, id)
+  - não-admin só pode deletar se for dono do escopo
+
+
+7.2.2) Reset do builder
+- concludeBuilder(actor)
+  - NÃO cria relatório.
+  - Apenas limpa as tabelas do builder no escopo do actor.
+  - Ordem de deletes respeita FKs (attachments -> questions -> sections).
+
+
+7.2.3) Concluir e salvar formulário (snapshot)
+- concludeBuilderAndSaveForm({ name, sentToEmail?, helpTexts?, metadata?, createdById })
+  - Valida name
+  - Carrega actor por createdById e valida acesso
+  - Dentro de transação:
+    1) carrega seções do escopo com anexos e perguntas
+    2) cria Report (type='BUILDER_FORM', status='COMPLETED') com content = JSON.stringify({ sentToEmail, sections, helpTexts, metadata })
+    3) limpa tabelas do builder (mesmo algoritmo do reset)
+
+Resultado:
+- O “form concluído” é um snapshot estático dentro do Report.content.
+
+
+7.2.4) Gestão de formulários concluídos
+- listConcludedForms(actor)
+  - ADMIN vê todos
+  - TRIAL_ADMIN geralmente limitado ao que criou
+
+- deleteForm(formId, actor)
+  - ADMIN pode deletar
+  - não-admin só pode deletar se for owner
+
+- getConcludedFormById(id, actor)
+  - aplica regras de acesso
+  - retorna form “desempacotado” (sections, metadata, helpTexts) a partir do JSON
+
+
+7.2.5) Enviar formulário ao usuário
+- sendFormToUser(formId, email, actor, helpTexts?)
+  - valida que report existe e type=BUILDER_FORM
+  - aplica permissão (trial só gerencia o próprio)
+  - seta assignedToEmail e status SENT_TO_USER
+  - pode atualizar helpTexts dentro do content
+
+
+7.2.6) Fluxo do usuário final (respostas/anexos)
+O “form do usuário” vive dentro do JSON do Report.content.
+
+- getUserForm(formId, userEmail)
+  - valida que assignedToEmail == userEmail
+  - retorna payload para o frontend
+
+- saveUserFormResponses(formId, userEmail, answers, sections?, metadata?)
+  - atualiza payload.sections[*].questions[*] com respostas
+  - atualiza metadata
+  - força status IN_PROGRESS
+
+- uploadUserFormAttachment(formId, userEmail, questionId, category, file, referenceText?)
+  - insere attachment dentro do JSON na questão correspondente
+  - também aplica limite de 5 anexos por categoria (remove mais antigo)
+
+IMPLICAÇÃO PRÁTICA (frontend):
+- Como cada upload atualiza o JSON inteiro do Report.content, uploads paralelos podem sobrescrever alterações entre si (“last-write-wins”).
+- Por isso o frontend faz upload sequencial no UserSubmissionsPage.
+
+- completeUserForm(formId, userEmail)
+  - valida 100% preenchido com base em aplicável/resposta
+  - atualiza status para COMPLETED
+
+
+============================================================
+8) DICAS DE DEPURAÇÃO (ONDE OLHAR)
+============================================================
+
+- “Usuário não consegue acessar builder”:
+  - src/middleware/auth.ts: requireBuilderAccess (trial expirado / pagamento)
+  - src/services/pldBuilder.service.ts: ensureBuilderAccess
+
+- “Uploads falham / 413 / limite”:
+  - src/config/upload.ts (Multer)
+  - handler de erros em src/app.ts
+
+- “Arquivos acessíveis sem login”:
+  - confirmar proteção de GET /uploads/*path (authenticateFromHeaderOrQuery)
+
+- “Anexos do usuário somem”:
+  - confirmar se uploads estão em paralelo (deveriam ser sequenciais)
+  - conferir uploadUserFormAttachment e lógica de merge no JSON
+
+
+FIM

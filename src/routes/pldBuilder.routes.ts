@@ -295,28 +295,6 @@ router.post('/forms/:id/send', authenticate, requireBuilderAccess, async (req, r
   }
 })
 
-// ADMIN: Aprovar formulário
-router.post('/forms/:id/approve', authenticate, requireBuilderAccess, async (req, res) => {
-  try {
-    const { id } = req.params
-    await PldBuilderService.approveForm(id, req.user!)
-    res.json({ message: 'Formulário aprovado com sucesso' })
-  } catch (error: any) {
-    res.status(400).json({ error: error.message })
-  }
-})
-
-// ADMIN: Devolver formulário para usuário
-router.post('/forms/:id/return', authenticate, requireBuilderAccess, async (req, res) => {
-  try {
-    const { id } = req.params
-    const { reason } = req.body as { reason?: string }
-    await PldBuilderService.returnForm(id, req.user!, reason)
-    res.json({ message: 'Formulário devolvido com sucesso' })
-  } catch (error: any) {
-    res.status(400).json({ error: error.message })
-  }
-})
 
 // USER: Obter formulário atribuído
 router.get('/forms/:id/user', authenticate, async (req, res) => {
@@ -341,17 +319,6 @@ router.post('/forms/:id/responses', authenticate, async (req, res) => {
   }
 })
 
-// USER: Enviar para revisão
-router.post('/forms/:id/submit', authenticate, async (req, res) => {
-  try {
-    const { id } = req.params
-    const { answers, sections, metadata } = req.body as { answers: any[]; sections?: any[]; metadata?: any }
-    await PldBuilderService.submitUserFormForReview(id, req.user!.email, answers, sections, metadata)
-    res.json({ message: 'Formulário enviado para revisão com sucesso' })
-  } catch (error: any) {
-    res.status(400).json({ error: error.message })
-  }
-})
 
 // USER: Concluir formulário (somente quando 100% preenchido)
 router.post('/forms/:id/complete', authenticate, async (req, res) => {

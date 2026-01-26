@@ -233,6 +233,10 @@ model PldQuestion {
   recomendacaoTexto      String?
   testStatus             PldTesteStatus?
   testDescription        String?
+  requisicaoRef          String?
+  respostaTesteRef       String?
+  amostraRef             String?
+  evidenciasRef          String?
   actionOrigem           String?
   actionResponsavel      String?
   actionDescricao        String?

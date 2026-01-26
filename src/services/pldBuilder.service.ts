@@ -524,15 +524,38 @@ export class PldBuilderService {
     const reports = await prismaAny.report.findMany({
       where,
       orderBy: { createdAt: 'desc' },
+      select: {
+        id: true,
+        name: true,
+        createdAt: true,
+        status: true,
+        assignedToEmail: true,
+        sentAt: true,
+        submittedAt: true,
+      },
     })
+
+    const needsContent = reports.filter((r: any) => !r.assignedToEmail).map((r: any) => r.id)
+    const contentById = new Map<string, string | null>()
+
+    if (needsContent.length) {
+      const contentRows = await prismaAny.report.findMany({
+        where: { id: { in: needsContent } },
+        select: { id: true, content: true },
+      })
+      contentRows.forEach((row: any) => contentById.set(row.id, row.content ?? null))
+    }
 
     return reports.map((r: any) => {
       let sentToEmail: string | null = null
-      try {
-        const parsed = r.content ? JSON.parse(r.content) : null
-        sentToEmail = typeof parsed?.sentToEmail === 'string' ? parsed.sentToEmail : null
-      } catch {
-        sentToEmail = null
+      const rawContent = contentById.get(r.id)
+      if (rawContent) {
+        try {
+          const parsed = rawContent ? JSON.parse(rawContent) : null
+          sentToEmail = typeof parsed?.sentToEmail === 'string' ? parsed.sentToEmail : null
+        } catch {
+          sentToEmail = null
+        }
       }
 
       return {
@@ -560,10 +583,19 @@ export class PldBuilderService {
         type: 'BUILDER_FORM',
         assignedToEmail: normalizedEmail,
         status: {
-          in: ['SENT_TO_USER', 'IN_PROGRESS', 'SENT_FOR_REVIEW', 'APPROVED', 'RETURNED', 'COMPLETED']
+          in: ['SENT_TO_USER', 'IN_PROGRESS', 'COMPLETED']
         }
       },
       orderBy: { createdAt: 'desc' },
+      select: {
+        id: true,
+        name: true,
+        createdAt: true,
+        status: true,
+        assignedToEmail: true,
+        sentAt: true,
+        submittedAt: true,
+      },
     })
 
     return reports.map((r: any) => ({
@@ -729,7 +761,7 @@ export class PldBuilderService {
       throw new Error('Você não tem permissão para editar este formulário')
     }
 
-    const editableStatuses = new Set(['SENT_TO_USER', 'IN_PROGRESS', 'RETURNED'])
+    const editableStatuses = new Set(['SENT_TO_USER', 'IN_PROGRESS'])
     if (report.status && !editableStatuses.has(report.status)) {
       throw new Error('Este formulário não pode mais ser editado')
     }
@@ -826,7 +858,7 @@ export class PldBuilderService {
       throw new Error('Você não tem permissão para concluir este formulário')
     }
 
-    const editableStatuses = new Set(['SENT_TO_USER', 'IN_PROGRESS', 'RETURNED'])
+    const editableStatuses = new Set(['SENT_TO_USER', 'IN_PROGRESS'])
     if (report.status && !editableStatuses.has(report.status)) {
       throw new Error('Este formulário não pode mais ser concluído')
     }
@@ -870,100 +902,6 @@ export class PldBuilderService {
     return { success: true }
   }
 
-  static async submitUserFormForReview(formId: string, userEmail: string, answers: any[], sections?: any[], metadata?: any) {
-    // First save responses
-    await this.saveUserFormResponses(formId, userEmail, answers, sections, metadata)
-
-    // Then update status to SENT_FOR_REVIEW
-    const report = await prismaAny.report.update({
-      where: { id: formId },
-      data: {
-        status: 'SENT_FOR_REVIEW',
-        submittedAt: new Date(),
-      },
-    })
-
-    // OPCIONAL: Notificar admin por email
-    // Descomente as linhas abaixo quando configurar SMTP
-    /*
-    try {
-      const admin = await prismaAny.user.findUnique({ where: { id: report.userId } })
-      if (admin?.email) {
-        const { sendFormSubmittedEmail } = await import('./formEmail.service')
-        await sendFormSubmittedEmail({
-          to: admin.email,
-          formName: report.name,
-          formId,
-          userEmail,
-        })
-      }
-    } catch (emailError) {
-      console.error('Erro ao enviar email:', emailError)
-    }
-    */
-
-    return { success: true }
-  }
-
-  static async approveForm(formId: string, actor: Pick<BuilderActor, 'id' | 'role'>) {
-    const report = await prismaAny.report.findUnique({ where: { id: formId } })
-    if (!report || report.type !== 'BUILDER_FORM') {
-      throw new Error('Formulário não encontrado')
-    }
-
-    if (actor.role === 'TRIAL_ADMIN' && report.userId !== actor.id) {
-      throw new Error('Você não tem permissão para gerenciar este formulário')
-    }
-
-    await prismaAny.report.update({
-      where: { id: formId },
-      data: {
-        status: 'APPROVED',
-        reviewedAt: new Date(),
-      },
-    })
-
-    return { success: true }
-  }
-
-  static async returnForm(formId: string, actor: Pick<BuilderActor, 'id' | 'role'>, reason?: string) {
-    const report = await prismaAny.report.findUnique({ where: { id: formId } })
-    if (!report || report.type !== 'BUILDER_FORM') {
-      throw new Error('Formulário não encontrado')
-    }
-
-    if (actor.role === 'TRIAL_ADMIN' && report.userId !== actor.id) {
-      throw new Error('Você não tem permissão para gerenciar este formulário')
-    }
-
-    await prismaAny.report.update({
-      where: { id: formId },
-      data: {
-        status: 'RETURNED',
-        reviewedAt: new Date(),
-      },
-    })
-
-    // OPCIONAL: Notificar usuário por email
-    // Descomente as linhas abaixo quando configurar SMTP
-    /*
-    try {
-      if (report.assignedToEmail) {
-        const { sendFormReturnedEmail } = await import('./formEmail.service')
-        await sendFormReturnedEmail({
-          to: report.assignedToEmail,
-          formName: report.name,
-          formId,
-          reason,
-        })
-      }
-    } catch (emailError) {
-      console.error('Erro ao enviar email:', emailError)
-    }
-    */
-
-    return { success: true }
-  }
 
   /**
    * Upload de arquivo pelo usuário para uma questão de um formulário.
