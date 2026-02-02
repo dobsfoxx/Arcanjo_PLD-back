@@ -39,23 +39,45 @@ const fileFilter = (req, file, cb) => {
         'image/gif',
         'application/pdf',
         'text/plain',
+        'text/csv',
         'application/msword',
         'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
         'application/vnd.ms-excel',
-        'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+        'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        'video/mp4'
     ];
-    if (allowedMimes.includes(file.mimetype)) {
+    const allowedExts = [
+        '.jpg',
+        '.jpeg',
+        '.png',
+        '.gif',
+        '.pdf',
+        '.txt',
+        '.csv',
+        '.doc',
+        '.docx',
+        '.xls',
+        '.xlsx',
+        '.mp4',
+    ];
+    const ext = path_1.default.extname(file.originalname || '').toLowerCase();
+    const isValidExt = ext && allowedExts.includes(ext);
+    if (allowedMimes.includes(file.mimetype) && isValidExt) {
         cb(null, true);
     }
     else {
-        cb(new Error('Tipo de arquivo não permitido. Use PDF, Word ou imagens.'));
+        cb(new Error('Tipo de arquivo não permitido. Use PDF, Word, Excel, TXT, CSV, MP4 ou imagens.'));
     }
 };
 // Configurar multer
 exports.upload = (0, multer_1.default)({
     storage,
     limits: {
-        fileSize: parseInt(process.env.MAX_FILE_SIZE || '10485760') // 10MB
+        fileSize: parseInt(process.env.MAX_FILE_SIZE || '20971520'), // 20MB
+        files: 5,
+        fields: 20,
+        fieldNameSize: 100,
+        fieldSize: 1024 * 1024,
     },
     fileFilter
 });

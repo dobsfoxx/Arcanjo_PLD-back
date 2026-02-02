@@ -451,21 +451,42 @@ class PldBuilderService {
     }
     static async listConcludedForms(actor) {
         this.ensureBuilderAccess(actor);
-        const where = { type: 'BUILDER_FORM' };
+        const where = { type: 'BUILDER_FORM', hiddenForAdmin: false };
         if (actor.role !== 'ADMIN')
             where.userId = actor.id;
         const reports = await prismaAny.report.findMany({
             where,
             orderBy: { createdAt: 'desc' },
+            select: {
+                id: true,
+                name: true,
+                createdAt: true,
+                status: true,
+                assignedToEmail: true,
+                sentAt: true,
+                submittedAt: true,
+            },
         });
+        const needsContent = reports.filter((r) => !r.assignedToEmail).map((r) => r.id);
+        const contentById = new Map();
+        if (needsContent.length) {
+            const contentRows = await prismaAny.report.findMany({
+                where: { id: { in: needsContent } },
+                select: { id: true, content: true },
+            });
+            contentRows.forEach((row) => contentById.set(row.id, row.content ?? null));
+        }
         return reports.map((r) => {
             let sentToEmail = null;
-            try {
-                const parsed = r.content ? JSON.parse(r.content) : null;
-                sentToEmail = typeof parsed?.sentToEmail === 'string' ? parsed.sentToEmail : null;
-            }
-            catch {
-                sentToEmail = null;
+            const rawContent = contentById.get(r.id);
+            if (rawContent) {
+                try {
+                    const parsed = rawContent ? JSON.parse(rawContent) : null;
+                    sentToEmail = typeof parsed?.sentToEmail === 'string' ? parsed.sentToEmail : null;
+                }
+                catch {
+                    sentToEmail = null;
+                }
             }
             return {
                 id: r.id,
@@ -489,11 +510,21 @@ class PldBuilderService {
             where: {
                 type: 'BUILDER_FORM',
                 assignedToEmail: normalizedEmail,
+                hiddenForUser: false,
                 status: {
-                    in: ['SENT_TO_USER', 'IN_PROGRESS', 'SENT_FOR_REVIEW', 'APPROVED', 'RETURNED', 'COMPLETED']
+                    in: ['SENT_TO_USER', 'IN_PROGRESS', 'COMPLETED']
                 }
             },
             orderBy: { createdAt: 'desc' },
+            select: {
+                id: true,
+                name: true,
+                createdAt: true,
+                status: true,
+                assignedToEmail: true,
+                sentAt: true,
+                submittedAt: true,
+            },
         });
         return reports.map((r) => ({
             id: r.id,
@@ -505,6 +536,25 @@ class PldBuilderService {
             submittedAt: r.submittedAt || null,
         }));
     }
+    /**
+     * Usuário oculta um formulário da sua lista (não deleta permanentemente)
+     */
+    static async deleteUserForm(formId, userEmail) {
+        const normalizedEmail = userEmail.toLowerCase();
+        const report = await prismaAny.report.findUnique({ where: { id: formId } });
+        if (!report || report.type !== 'BUILDER_FORM') {
+            throw new Error('Formulário não encontrado');
+        }
+        if (report.assignedToEmail !== normalizedEmail) {
+            throw new Error('Você não tem permissão para remover este formulário');
+        }
+        // Apenas oculta o formulário para o usuário, não deleta permanentemente
+        await prismaAny.report.update({
+            where: { id: formId },
+            data: { hiddenForUser: true }
+        });
+        return { success: true };
+    }
     static async deleteForm(formId, actor) {
         this.ensureBuilderAccess(actor);
         const report = await prismaAny.report.findUnique({ where: { id: formId } });
@@ -514,7 +564,11 @@ class PldBuilderService {
         if (actor.role !== 'ADMIN' && report.userId !== actor.id) {
             throw new Error('Você não tem permissão para excluir este formulário');
         }
-        await prismaAny.report.delete({ where: { id: formId } });
+        // Apenas oculta o formulário para o admin, não deleta permanentemente
+        await prismaAny.report.update({
+            where: { id: formId },
+            data: { hiddenForAdmin: true }
+        });
         return { success: true };
     }
     static async getConcludedFormById(id, actor) {
@@ -630,7 +684,7 @@ class PldBuilderService {
         if (report.assignedToEmail !== userEmail.toLowerCase()) {
             throw new Error('Você não tem permissão para editar este formulário');
         }
-        const editableStatuses = new Set(['SENT_TO_USER', 'IN_PROGRESS', 'RETURNED']);
+        const editableStatuses = new Set(['SENT_TO_USER', 'IN_PROGRESS']);
         if (report.status && !editableStatuses.has(report.status)) {
             throw new Error('Este formulário não pode mais ser editado');
         }
@@ -719,7 +773,7 @@ class PldBuilderService {
         if (report.assignedToEmail !== userEmail.toLowerCase()) {
             throw new Error('Você não tem permissão para concluir este formulário');
         }
-        const editableStatuses = new Set(['SENT_TO_USER', 'IN_PROGRESS', 'RETURNED']);
+        const editableStatuses = new Set(['SENT_TO_USER', 'IN_PROGRESS']);
         if (report.status && !editableStatuses.has(report.status)) {
             throw new Error('Este formulário não pode mais ser concluído');
         }
@@ -756,88 +810,6 @@ class PldBuilderService {
                 submittedAt: new Date(),
             },
         });
-        return { success: true };
-    }
-    static async submitUserFormForReview(formId, userEmail, answers, sections, metadata) {
-        // First save responses
-        await this.saveUserFormResponses(formId, userEmail, answers, sections, metadata);
-        // Then update status to SENT_FOR_REVIEW
-        const report = await prismaAny.report.update({
-            where: { id: formId },
-            data: {
-                status: 'SENT_FOR_REVIEW',
-                submittedAt: new Date(),
-            },
-        });
-        // OPCIONAL: Notificar admin por email
-        // Descomente as linhas abaixo quando configurar SMTP
-        /*
-        try {
-          const admin = await prismaAny.user.findUnique({ where: { id: report.userId } })
-          if (admin?.email) {
-            const { sendFormSubmittedEmail } = await import('./formEmail.service')
-            await sendFormSubmittedEmail({
-              to: admin.email,
-              formName: report.name,
-              formId,
-              userEmail,
-            })
-          }
-        } catch (emailError) {
-          console.error('Erro ao enviar email:', emailError)
-        }
-        */
-        return { success: true };
-    }
-    static async approveForm(formId, actor) {
-        const report = await prismaAny.report.findUnique({ where: { id: formId } });
-        if (!report || report.type !== 'BUILDER_FORM') {
-            throw new Error('Formulário não encontrado');
-        }
-        if (actor.role === 'TRIAL_ADMIN' && report.userId !== actor.id) {
-            throw new Error('Você não tem permissão para gerenciar este formulário');
-        }
-        await prismaAny.report.update({
-            where: { id: formId },
-            data: {
-                status: 'APPROVED',
-                reviewedAt: new Date(),
-            },
-        });
-        return { success: true };
-    }
-    static async returnForm(formId, actor, reason) {
-        const report = await prismaAny.report.findUnique({ where: { id: formId } });
-        if (!report || report.type !== 'BUILDER_FORM') {
-            throw new Error('Formulário não encontrado');
-        }
-        if (actor.role === 'TRIAL_ADMIN' && report.userId !== actor.id) {
-            throw new Error('Você não tem permissão para gerenciar este formulário');
-        }
-        await prismaAny.report.update({
-            where: { id: formId },
-            data: {
-                status: 'RETURNED',
-                reviewedAt: new Date(),
-            },
-        });
-        // OPCIONAL: Notificar usuário por email
-        // Descomente as linhas abaixo quando configurar SMTP
-        /*
-        try {
-          if (report.assignedToEmail) {
-            const { sendFormReturnedEmail } = await import('./formEmail.service')
-            await sendFormReturnedEmail({
-              to: report.assignedToEmail,
-              formName: report.name,
-              formId,
-              reason,
-            })
-          }
-        } catch (emailError) {
-          console.error('Erro ao enviar email:', emailError)
-        }
-        */
         return { success: true };
     }
     /**

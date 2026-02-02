@@ -12,7 +12,17 @@ const crypto_1 = __importDefault(require("crypto"));
 // Import com require para evitar problemas de resolução de tipos em tempo de compilação
 // eslint-disable-next-line @typescript-eslint/no-var-requires, @typescript-eslint/no-unsafe-assignment
 const { EmailService } = require('./email.service');
-const SALT_ROUNDS = 10;
+const parsedRounds = Number.parseInt(process.env.BCRYPT_SALT_ROUNDS || '12', 10);
+const SALT_ROUNDS = Number.isFinite(parsedRounds) && parsedRounds >= 10 ? parsedRounds : 12;
+const PASSWORD_REGEX = /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[^A-Za-z0-9]).{8,128}$/;
+function assertStrongPassword(password, minLen = 8) {
+    const withinMin = password.length >= minLen;
+    if (!withinMin || !PASSWORD_REGEX.test(password)) {
+        throw new Error(minLen >= 12
+            ? 'Senha do administrador deve ter pelo menos 12 caracteres e conter letra maiúscula, minúscula, número e símbolo'
+            : 'A senha deve ter pelo menos 8 caracteres e conter letra maiúscula, minúscula, número e símbolo');
+    }
+}
 class AuthService {
     /**
      * Autentica/registra usuário via Google OAuth.
@@ -56,9 +66,7 @@ class AuthService {
         if (existing) {
             throw new Error('E-mail já está em uso');
         }
-        if (password.length < 8) {
-            throw new Error('A senha deve ter pelo menos 8 caracteres');
-        }
+        assertStrongPassword(password, 8);
         const hashedPassword = await bcryptjs_1.default.hash(password, SALT_ROUNDS);
         const startTrial = !!opts?.startTrial;
         const trialExpiresAt = startTrial ? new Date(Date.now() + 3 * 24 * 60 * 60 * 1000) : null;
@@ -108,9 +116,7 @@ class AuthService {
         if (anyAdmin) {
             throw new Error('Já existe um administrador cadastrado');
         }
-        if (password.length < 10) {
-            throw new Error('Senha do administrador deve ter pelo menos 10 caracteres');
-        }
+        assertStrongPassword(password, 12);
         const hashedPassword = await bcryptjs_1.default.hash(password, SALT_ROUNDS);
         const user = await database_1.default.user.create({
             data: {
@@ -156,9 +162,7 @@ class AuthService {
     }
     // Redefinir senha a partir de um token válido
     static async resetPassword(token, newPassword) {
-        if (newPassword.length < 8) {
-            throw new Error('A nova senha deve ter pelo menos 8 caracteres');
-        }
+        assertStrongPassword(newPassword, 8);
         const resetToken = await database_1.default.passwordResetToken.findUnique({
             where: { token },
             include: { user: true },

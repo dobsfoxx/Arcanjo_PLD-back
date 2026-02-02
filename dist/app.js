@@ -7,6 +7,8 @@ const express_1 = __importDefault(require("express"));
 const cors_1 = __importDefault(require("cors"));
 const helmet_1 = __importDefault(require("helmet"));
 const morgan_1 = __importDefault(require("morgan"));
+const express_rate_limit_1 = __importDefault(require("express-rate-limit"));
+const hpp_1 = __importDefault(require("hpp"));
 const dotenv_1 = require("dotenv");
 const path_1 = __importDefault(require("path"));
 const multer_1 = __importDefault(require("multer"));
@@ -19,8 +21,18 @@ const billing_webhook_1 = require("./routes/billing.webhook");
 const publicError_1 = require("./utils/publicError");
 (0, dotenv_1.config)();
 const app = (0, express_1.default)();
+const trustProxyValue = process.env.TRUST_PROXY;
+if (trustProxyValue) {
+    const parsed = Number.parseInt(trustProxyValue, 10);
+    app.set('trust proxy', Number.isFinite(parsed) ? parsed : 1);
+}
+else if (process.env.NODE_ENV === 'production') {
+    app.set('trust proxy', 1);
+}
 // Segurança básica
-app.use((0, helmet_1.default)());
+app.use((0, helmet_1.default)({
+    crossOriginResourcePolicy: { policy: 'cross-origin' },
+}));
 // Não expor assinatura do framework
 app.disable('x-powered-by');
 // CORS - configure via CORS_ORIGIN (lista separada por vírgula). Ex: "https://app.com,http://localhost:5173"
@@ -41,13 +53,27 @@ app.use((0, cors_1.default)({
         }
         return cb(null, corsAllowlist.includes(origin));
     },
+    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'X-Bootstrap-Token'],
 }));
+// Proteção contra HTTP Parameter Pollution
+app.use((0, hpp_1.default)());
+// Rate limit geral da API
+const apiLimiter = (0, express_rate_limit_1.default)({
+    windowMs: 15 * 60 * 1000,
+    max: 300,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { error: 'Muitas requisições. Tente novamente em instantes.' },
+});
+app.use('/api', apiLimiter);
 // Logs de requisição
 app.use((0, morgan_1.default)('combined'));
 // Stripe webhook precisa do corpo "raw" (não JSON parseado)
 app.post('/api/billing/webhook', express_1.default.raw({ type: 'application/json' }), billing_webhook_1.billingWebhookHandler);
 // Body parser
-app.use(express_1.default.json({ limit: '10mb' }));
+app.use(express_1.default.json({ limit: process.env.JSON_LIMIT || '5mb' }));
+app.use(express_1.default.urlencoded({ extended: false, limit: process.env.URLENCODED_LIMIT || '1mb' }));
 // Cookies (para auth via HttpOnly cookie)
 app.use((0, cookie_parser_1.default)());
 // Test route

@@ -4,11 +4,30 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
 };
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.FormService = void 0;
+/**
+ * FormService - Serviço de Gerenciamento de Formulários PLD
+ *
+ * Este serviço gerencia todas as operações relacionadas a formulários,
+ * tópicos, questões, respostas e evidências no sistema PLD.
+ *
+ * Principais funcionalidades:
+ * - CRUD de tópicos e questões
+ * - Gerenciamento de respostas e evidências
+ * - Controle de atribuições de formulários
+ * - Upload e exclusão de arquivos
+ */
 const database_1 = __importDefault(require("../config/database"));
 class FormService {
     // =========== TÓPICOS ===========
+    /**
+     * Cria um novo tópico no formulário
+     * @param userId - ID do usuário criador
+     * @param name - Nome do tópico
+     * @param description - Descrição opcional
+     * @param internalNorm - Norma interna relacionada
+     */
     static async createTopic(userId, name, description, internalNorm) {
-        // Contar tópicos para definir ordem
+        // Conta tópicos existentes para definir ordem
         const count = await database_1.default.topic.count();
         return await database_1.default.topic.create({
             data: {
@@ -20,8 +39,10 @@ class FormService {
             },
         });
     }
-    // Listar tópicos com perguntas, trazendo apenas a resposta do usuário atual.
-    // ADMIN vê todos os tópicos; USER só vê tópicos atribuídos a ele.
+    /**
+     * Lista tópicos com perguntas e respostas do usuário atual
+     * ADMIN vê todos os tópicos; USER vê apenas os atribuídos a ele
+     */
     static async getTopics(userId, role) {
         const where = { isActive: true };
         if (role !== 'ADMIN') {
@@ -47,7 +68,7 @@ class FormService {
             },
             orderBy: { order: 'asc' },
         });
-        // Tópico e pergunta(usuario)
+        // Adapta estrutura de tópico e pergunta para o frontend
         const adapted = topics.map((topic) => ({
             ...topic,
             questions: topic.questions.map((question) => {
@@ -343,34 +364,20 @@ class FormService {
     // =========== PROGRESSO ===========
     // Calcular progresso geral
     static async calculateProgress(userId) {
-        const topics = await database_1.default.topic.findMany({
-            where: { isActive: true },
-            include: {
-                questions: {
-                    include: {
-                        answers: {
-                            where: { userId },
-                        },
-                    },
+        const [totalQuestions, totalApplicable, totalAnswered] = await Promise.all([
+            database_1.default.question.count({
+                where: { topic: { isActive: true } },
+            }),
+            database_1.default.question.count({
+                where: { isApplicable: true, topic: { isActive: true } },
+            }),
+            database_1.default.answer.count({
+                where: {
+                    userId,
+                    question: { isApplicable: true, topic: { isActive: true } },
                 },
-            },
-        });
-        const topicList = topics || [];
-        let totalApplicable = 0;
-        let totalAnswered = 0;
-        let totalQuestions = 0;
-        for (const topic of topicList) {
-            const questions = topic.questions || [];
-            totalQuestions += questions.length;
-            for (const question of questions) {
-                if (question.isApplicable) {
-                    totalApplicable++;
-                    if (question.answers && question.answers.length > 0) {
-                        totalAnswered++;
-                    }
-                }
-            }
-        }
+            }),
+        ]);
         const progress = totalApplicable > 0
             ? Math.round((totalAnswered / totalApplicable) * 100)
             : 0;
@@ -385,31 +392,31 @@ class FormService {
     static async calculateTopicProgress(topicId, userId) {
         const topic = await database_1.default.topic.findUnique({
             where: { id: topicId },
-            include: {
-                questions: {
-                    include: {
-                        answers: {
-                            where: { userId },
-                        },
-                    },
-                },
-            },
+            select: { id: true, name: true },
         });
         if (!topic) {
             throw new Error('Tópico não encontrado');
         }
-        const applicableQuestions = topic.questions.filter((q) => q.isApplicable);
-        const answeredQuestions = applicableQuestions.filter((q) => q.answers && q.answers.length > 0);
-        const progress = applicableQuestions.length > 0
-            ? Math.round((answeredQuestions.length / applicableQuestions.length) * 100)
+        const [totalQuestions, applicableCount, answeredCount] = await Promise.all([
+            database_1.default.question.count({ where: { topicId } }),
+            database_1.default.question.count({ where: { topicId, isApplicable: true } }),
+            database_1.default.answer.count({
+                where: {
+                    userId,
+                    question: { topicId, isApplicable: true },
+                },
+            }),
+        ]);
+        const progress = applicableCount > 0
+            ? Math.round((answeredCount / applicableCount) * 100)
             : 0;
         return {
             topicId: topic.id,
             topicName: topic.name,
             progress,
-            applicableCount: applicableQuestions.length,
-            answeredCount: answeredQuestions.length,
-            totalQuestions: topic.questions.length
+            applicableCount,
+            answeredCount,
+            totalQuestions,
         };
     }
     // =========== DADOS DO FORMULÁRIO ===========

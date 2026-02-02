@@ -4,6 +4,19 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
 };
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.ReportService = void 0;
+/**
+ * ReportService - Serviço de Geração de Relatórios PLD
+ *
+ * Este serviço é responsável por gerar relatórios de avaliação de PLD
+ * em formato PDF. Processa os dados do formulário e cria documentos
+ * formatados com seções, questões, deficiências e anexos de evidências.
+ *
+ * Principais funcionalidades:
+ * - Geração de relatórios PDF completos
+ * - Tabelas de critérios (criticidade, efetividade)
+ * - Anexo de evidências com links para arquivos
+ * - Suporte a múltiplas instituições avaliadas
+ */
 const fs_1 = __importDefault(require("fs"));
 const path_1 = __importDefault(require("path"));
 const pdfkit_1 = __importDefault(require("pdfkit"));
@@ -13,40 +26,392 @@ const form_services_1 = require("./form.services");
 const paths_1 = require("../config/paths");
 const storage_1 = require("../config/storage");
 class ReportService {
+    /**
+     * Sanitiza o título da questão removendo espaços e validando o tipo
+     */
     static sanitizeQuestionTitle(raw) {
         if (typeof raw !== "string")
             return "-";
         const title = raw.trim();
-        if (!title)
+        return title || "-";
+    }
+    /**
+     * Formata data para o padrão brasileiro (DD/MM/AAAA)
+     */
+    static formatDatePtBr(date) {
+        if (!(date instanceof Date) || Number.isNaN(date.getTime()))
             return "-";
-        // Bloqueia padrões comuns de segredos/tokens/hashes que jamais deveriam ser um título de pergunta.
-        // Ex.: bcrypt ($2a$/$2b$/$2y$), argon2 ($argon2id$), JWT (xxx.yyy.zzz)
-        const looksLikeBcrypt = /^\$2[aby]\$\d{2}\$/.test(title);
-        const looksLikeArgon2 = /^\$argon2(id|i|d)\$/.test(title);
-        const looksLikeJwt = /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(title);
-        const looksLikeLongHex = title.length >= 32 && /^[a-f0-9]+$/i.test(title);
-        const looksLikeLongNoSpaces = title.length >= 60 && !/\s/.test(title);
-        if (looksLikeBcrypt || looksLikeArgon2 || looksLikeJwt || (looksLikeLongHex && looksLikeLongNoSpaces)) {
-            return "[DADO SENSÍVEL REMOVIDO]";
+        return date.toLocaleDateString("pt-BR");
+    }
+    /**
+     * Extrai labels das seções para exibição no relatório
+     */
+    static getSectionLabels(sections) {
+        return sections.map((section) => {
+            const label = (section?.customLabel || "").trim()
+                ? `${section.item} - ${section.customLabel}`
+                : section?.item;
+            return label || "-";
+        });
+    }
+    /**
+     * Coleta todas as deficiências identificadas nas questões
+     * para gerar a tabela de conclusão do relatório
+     *
+     * Uma deficiência é identificada quando:
+     * - A resposta é "Não" (NAO)
+     * - A criticidade está definida
+     */
+    static collectDeficiencias(sections) {
+        const items = [];
+        sections.forEach((section) => {
+            const sectionLabel = (section?.customLabel || "").trim()
+                ? `${section.item} - ${section.customLabel}`
+                : section?.item;
+            (section?.questions || []).forEach((question) => {
+                // Verifica se é uma deficiência: resposta "Não" + criticidade definida
+                const resposta = (question?.resposta || "").toString().trim();
+                // Normaliza para comparação: remove acentos e converte para minúsculas
+                const respostaNormalized = resposta
+                    .toLowerCase()
+                    .normalize("NFD")
+                    .replace(/[\u0300-\u036f]/g, "");
+                // Verifica se é "Não" (nao, não, n) e NÃO é "Sim" (sim, s)
+                const isRespostaNao = respostaNormalized === "nao" || respostaNormalized === "n";
+                const isRespostaSim = respostaNormalized === "sim" || respostaNormalized === "s";
+                // Se for "Sim" ou não for "Não", pula
+                if (isRespostaSim || !isRespostaNao)
+                    return;
+                const criticidade = (question?.criticidade || "").toString().toUpperCase().trim();
+                const hasCriticidade = criticidade === "ALTA" || criticidade === "MEDIA" || criticidade === "BAIXA";
+                // Só inclui se tem resposta "Não" e criticidade definida
+                if (!hasCriticidade)
+                    return;
+                items.push({
+                    sectionLabel: sectionLabel || "-",
+                    questionTitle: ReportService.sanitizeQuestionTitle(question?.texto),
+                    deficiencia: question?.deficienciaTexto ? String(question.deficienciaTexto) : "-",
+                    criticidade: criticidade,
+                    recomendacao: question?.recomendacaoTexto
+                        ? String(question.recomendacaoTexto)
+                        : undefined,
+                });
+            });
+        });
+        return items;
+    }
+    /**
+     * Calcula o resultado da avaliação de efetividade baseado nas deficiências de alta criticidade
+     * em itens específicos: MSAC, CSNU e CSC
+     *
+     * Uma deficiência é identificada quando:
+     * - A resposta da pergunta é "Não"
+     * - A criticidade é "ALTA"
+     *
+     * - EFETIVO: Nenhuma deficiência de alta criticidade nos 3 itens
+     * - PARCIALMENTE EFETIVO: Deficiências de alta criticidade em até 2 dos itens
+     * - POUCO EFETIVO: Deficiências de alta criticidade nos 3 itens
+     */
+    static calcularResultadoAvaliacao(sections) {
+        // Palavras-chave para identificar cada tipo de item
+        const msacKeywords = ["msac", "monitoramento", "seleção", "análise", "comunicação", "operações atípicas", "operações suspeitas"];
+        const csnuKeywords = ["csnu", "sanções", "lei 13.810", "resolução bcb 44", "instrução normativa bcb 262"];
+        const cscKeywords = ["conheça seu cliente", "csc", "kyc", "know your customer"];
+        const normalizeText = (text) => (text || "")
+            .toLowerCase()
+            .normalize("NFD")
+            .replace(/[\u0300-\u036f]/g, "");
+        const containsKeyword = (text, keywords) => {
+            const normalized = normalizeText(text);
+            return keywords.some((keyword) => normalized.includes(normalizeText(keyword)));
+        };
+        // Verifica se a resposta indica "Não" (deficiência identificada)
+        const isRespostaNao = (resposta) => {
+            const normalizedResposta = normalizeText(String(resposta || ""));
+            // Após normalizeText, "não" vira "nao", então só comparamos com "nao" e "n"
+            return normalizedResposta === "nao" || normalizedResposta === "n";
+        };
+        let msacComAltaCriticidade = false;
+        let csnuComAltaCriticidade = false;
+        let cscComAltaCriticidade = false;
+        sections.forEach((section) => {
+            const sectionLabel = (section?.customLabel || section?.item || "").toString();
+            const sectionDescricao = (section?.descricao || "").toString();
+            const sectionContext = `${sectionLabel} ${sectionDescricao}`;
+            (section?.questions || []).forEach((question) => {
+                if (question?.aplicavel === false)
+                    return;
+                // Verifica se é uma deficiência: resposta = "Não"
+                const resposta = question?.resposta;
+                if (!isRespostaNao(resposta))
+                    return;
+                // Verifica se a criticidade é ALTA
+                const criticidade = String(question?.criticidade || "").toUpperCase();
+                if (criticidade !== "ALTA")
+                    return;
+                // Se há deficiência de alta criticidade, verificar em qual categoria se encaixa
+                const questionTexto = (question?.texto || "").toString();
+                const questionDesc = (question?.descricao || "").toString();
+                const deficienciaTexto = (question?.deficienciaTexto || "").toString();
+                const fullContext = `${sectionContext} ${questionTexto} ${questionDesc} ${deficienciaTexto}`;
+                if (containsKeyword(fullContext, msacKeywords)) {
+                    msacComAltaCriticidade = true;
+                }
+                if (containsKeyword(fullContext, csnuKeywords)) {
+                    csnuComAltaCriticidade = true;
+                }
+                if (containsKeyword(fullContext, cscKeywords)) {
+                    cscComAltaCriticidade = true;
+                }
+            });
+        });
+        const countItensComAltaCriticidade = [msacComAltaCriticidade, csnuComAltaCriticidade, cscComAltaCriticidade].filter(Boolean).length;
+        let resultado;
+        let descricao;
+        if (countItensComAltaCriticidade <= 1) {
+            // EFETIVO: 0 ou 1 item com deficiência de alta criticidade
+            resultado = "EFETIVO";
+            descricao =
+                "O programa de PLD/FTP atingiu a maioria dos resultados esperados, sem a identificação de deficiências de alta criticidade nos procedimentos de monitoramento, seleção, análise e comunicação de operações atípicas (MSAC), nos procedimentos de verificação de sanções CSNU, e nos procedimentos conheça seu cliente (CSC).";
         }
-        return title;
+        else if (countItensComAltaCriticidade === 2) {
+            // PARCIALMENTE EFETIVO: exatamente 2 dos 3 itens com deficiência de alta criticidade
+            resultado = "PARCIALMENTE EFETIVO";
+            descricao =
+                "O programa de PLD/FTP atingiu a maioria dos resultados esperados, porém foram identificadas deficiências de alta criticidade em alguns dos procedimentos avaliados (MSAC, CSNU ou CSC).";
+        }
+        else {
+            // POUCO EFETIVO: 3 itens com deficiência de alta criticidade
+            resultado = "POUCO EFETIVO";
+            descricao =
+                "O programa de PLD/FTP não atingiu a maioria dos resultados esperados, com a identificação de deficiências de alta criticidade nos procedimentos de monitoramento, seleção, análise e comunicação de operações atípicas (MSAC), nos procedimentos de verificação de sanções CSNU, e nos procedimentos conheça seu cliente (CSC).";
+        }
+        return {
+            resultado,
+            descricao,
+            detalhes: {
+                msacComAltaCriticidade,
+                csnuComAltaCriticidade,
+                cscComAltaCriticidade,
+            },
+        };
+    }
+    static buildEvidenceAnnexRows(sections, executionPrefix, baseUrl) {
+        return (sections || []).map((section, sectionIndex) => {
+            const sectionLabel = (section?.customLabel || "").trim()
+                ? `${section.item} - ${section.customLabel}`
+                : section?.item || "-";
+            const itemLabel = `${executionPrefix}.${sectionIndex + 1} ${sectionLabel || "-"}`;
+            const sectionAtts = Array.isArray(section?.attachments) ? section.attachments : [];
+            const questionAtts = Array.isArray(section?.questions)
+                ? section.questions.flatMap((q) => Array.isArray(q?.attachments) ? q.attachments : [])
+                : [];
+            const uniqueAtts = Array.from([...sectionAtts, ...questionAtts]
+                .reduce((acc, att) => {
+                const key = `${att?.category || ""}|${att?.path || ""}|${att?.originalName || ""}|${att?.filename || ""}`;
+                acc.set(key, att);
+                return acc;
+            }, new Map())
+                .values());
+            const files = uniqueAtts.map((att) => {
+                const name = att?.originalName ||
+                    att?.filename ||
+                    (typeof att?.path === "string" ? path_1.default.basename(att.path) : "");
+                const url = ReportService.buildEvidenceLink(att, baseUrl);
+                return { name: String(name || "Arquivo"), url };
+            });
+            return { itemLabel, files };
+        });
+    }
+    static buildEvidenceAnnexTableDocx(rows) {
+        const tableWidth = 9360;
+        const col1Width = 3200;
+        const col2Width = tableWidth - col1Width;
+        // Header da tabela com fundo azul escuro
+        const headerRow = new docx_1.TableRow({
+            tableHeader: true,
+            children: [
+                new docx_1.TableCell({
+                    width: { size: col1Width, type: docx_1.WidthType.DXA },
+                    shading: { type: docx_1.ShadingType.CLEAR, color: "auto", fill: "1E3A5F" },
+                    margins: { top: 100, bottom: 100, left: 120, right: 120 },
+                    children: [
+                        new docx_1.Paragraph({
+                            children: [new docx_1.TextRun({ text: "Item Avaliado", bold: true, color: "FFFFFF", size: 22 })],
+                        }),
+                    ],
+                }),
+                new docx_1.TableCell({
+                    width: { size: col2Width, type: docx_1.WidthType.DXA },
+                    shading: { type: docx_1.ShadingType.CLEAR, color: "auto", fill: "1E3A5F" },
+                    margins: { top: 100, bottom: 100, left: 120, right: 120 },
+                    children: [
+                        new docx_1.Paragraph({
+                            children: [new docx_1.TextRun({ text: "Arquivos Anexados", bold: true, color: "FFFFFF", size: 22 })],
+                        }),
+                    ],
+                }),
+            ],
+        });
+        // Linhas de dados com cores alternadas
+        const dataRows = rows.map((row, idx) => {
+            const bgColor = idx % 2 === 0 ? "F8FAFC" : "FFFFFF";
+            // Cria os parágrafos com links para cada arquivo
+            const fileChildren = row.files.length > 0
+                ? row.files.map((f) => new docx_1.Paragraph({
+                    spacing: { after: 60 },
+                    children: [
+                        new docx_1.TextRun({ text: "• ", color: "1E3A5F" }),
+                        f.url
+                            ? new docx_1.ExternalHyperlink({
+                                link: f.url,
+                                children: [new docx_1.TextRun({ text: f.name, color: "2563EB", underline: {} })],
+                            })
+                            : new docx_1.TextRun({ text: f.name, color: "374151" }),
+                    ],
+                }))
+                : [new docx_1.Paragraph({
+                        children: [new docx_1.TextRun({ text: "Nenhum arquivo", italics: true, color: "9CA3AF" })],
+                    })];
+            return new docx_1.TableRow({
+                children: [
+                    new docx_1.TableCell({
+                        width: { size: col1Width, type: docx_1.WidthType.DXA },
+                        shading: { type: docx_1.ShadingType.CLEAR, color: "auto", fill: bgColor },
+                        margins: { top: 80, bottom: 80, left: 120, right: 120 },
+                        verticalAlign: "top",
+                        children: [
+                            new docx_1.Paragraph({
+                                children: [new docx_1.TextRun({ text: row.itemLabel || "-", bold: true, color: "1F2937", size: 21 })],
+                            }),
+                        ],
+                    }),
+                    new docx_1.TableCell({
+                        width: { size: col2Width, type: docx_1.WidthType.DXA },
+                        shading: { type: docx_1.ShadingType.CLEAR, color: "auto", fill: bgColor },
+                        margins: { top: 80, bottom: 80, left: 120, right: 120 },
+                        children: fileChildren,
+                    }),
+                ],
+            });
+        });
+        return new docx_1.Table({
+            layout: docx_1.TableLayoutType.FIXED,
+            width: { size: tableWidth, type: docx_1.WidthType.DXA },
+            columnWidths: [col1Width, col2Width],
+            borders: {
+                top: { style: docx_1.BorderStyle.SINGLE, size: 8, color: "CBD5E1" },
+                bottom: { style: docx_1.BorderStyle.SINGLE, size: 8, color: "CBD5E1" },
+                left: { style: docx_1.BorderStyle.SINGLE, size: 8, color: "CBD5E1" },
+                right: { style: docx_1.BorderStyle.SINGLE, size: 8, color: "CBD5E1" },
+                insideHorizontal: { style: docx_1.BorderStyle.SINGLE, size: 4, color: "E2E8F0" },
+                insideVertical: { style: docx_1.BorderStyle.SINGLE, size: 4, color: "E2E8F0" },
+            },
+            rows: [headerRow, ...dataRows],
+        });
+    }
+    static buildDocxStyles() {
+        return {
+            default: {
+                document: {
+                    run: { font: "Calibri", size: 22, color: "374151" },
+                    paragraph: { spacing: { line: 276, after: 120 } },
+                },
+            },
+            paragraphStyles: [
+                {
+                    id: "Title",
+                    name: "Title",
+                    basedOn: "Normal",
+                    next: "Normal",
+                    run: { size: 44, bold: true, color: "1E3A5F", font: "Calibri Light" },
+                    paragraph: { alignment: docx_1.AlignmentType.CENTER, spacing: { after: 300 } },
+                },
+                {
+                    id: "Heading1",
+                    name: "Heading 1",
+                    basedOn: "Normal",
+                    next: "Normal",
+                    run: { size: 28, bold: true, color: "1E3A5F" },
+                    paragraph: { spacing: { before: 360, after: 160 } },
+                },
+                {
+                    id: "Heading2",
+                    name: "Heading 2",
+                    basedOn: "Normal",
+                    next: "Normal",
+                    run: { size: 24, bold: true, color: "1E3A5F" },
+                    paragraph: { spacing: { before: 280, after: 120 } },
+                },
+                {
+                    id: "Heading3",
+                    name: "Heading 3",
+                    basedOn: "Normal",
+                    next: "Normal",
+                    run: { size: 22, bold: true, color: "334155" },
+                    paragraph: { spacing: { before: 200, after: 80 } },
+                },
+                {
+                    id: "Normal",
+                    name: "Normal",
+                    run: { size: 22, color: "374151" },
+                    paragraph: { spacing: { line: 276, after: 120 } },
+                },
+            ],
+            characterStyles: [
+                {
+                    id: "Hyperlink",
+                    name: "Hyperlink",
+                    basedOn: "DefaultParagraphFont",
+                    run: { color: "2563EB", underline: {} },
+                },
+            ],
+        };
+    }
+    static buildDocxFullWidthTitle(text, alignment = docx_1.AlignmentType.LEFT) {
+        // Título com fundo azul escuro para destaque profissional
+        const titleWidth = 9360;
+        return new docx_1.Table({
+            layout: docx_1.TableLayoutType.FIXED,
+            width: { size: titleWidth, type: docx_1.WidthType.DXA },
+            columnWidths: [titleWidth],
+            borders: {
+                top: { style: docx_1.BorderStyle.NONE, size: 0, color: "FFFFFF" },
+                bottom: { style: docx_1.BorderStyle.NONE, size: 0, color: "FFFFFF" },
+                left: { style: docx_1.BorderStyle.NONE, size: 0, color: "FFFFFF" },
+                right: { style: docx_1.BorderStyle.NONE, size: 0, color: "FFFFFF" },
+            },
+            rows: [
+                new docx_1.TableRow({
+                    children: [
+                        new docx_1.TableCell({
+                            width: { size: titleWidth, type: docx_1.WidthType.DXA },
+                            margins: { top: 140, bottom: 140, left: 200, right: 200 },
+                            shading: { type: docx_1.ShadingType.CLEAR, color: "auto", fill: "1E3A5F" },
+                            children: [
+                                new docx_1.Paragraph({
+                                    alignment,
+                                    children: [new docx_1.TextRun({ text, bold: true, size: 28, color: "FFFFFF" })],
+                                }),
+                            ],
+                        }),
+                    ],
+                }),
+            ],
+        });
     }
     static buildDocxCard(children) {
-        const cardWidthTwips = 9360; //Largura da A4 com margens de 1 polegada
+        const cardWidthTwips = 9360; // Largura da A4 com margens de 1 polegada
         return new docx_1.Table({
-            layout: docx_1.TableLayoutType.FIXED, //evita quebras estranhas
+            layout: docx_1.TableLayoutType.FIXED,
             width: { size: cardWidthTwips, type: docx_1.WidthType.DXA },
             columnWidths: [cardWidthTwips],
             borders: {
-                top: { style: docx_1.BorderStyle.SINGLE, size: 8, color: "E2E8F0" },
-                bottom: { style: docx_1.BorderStyle.SINGLE, size: 8, color: "E2E8F0" },
-                left: { style: docx_1.BorderStyle.SINGLE, size: 8, color: "E2E8F0" },
-                right: { style: docx_1.BorderStyle.SINGLE, size: 8, color: "E2E8F0" },
-                insideHorizontal: {
-                    style: docx_1.BorderStyle.SINGLE,
-                    size: 0,
-                    color: "FFFFFF",
-                },
+                top: { style: docx_1.BorderStyle.SINGLE, size: 8, color: "CBD5E1" },
+                bottom: { style: docx_1.BorderStyle.SINGLE, size: 8, color: "CBD5E1" },
+                left: { style: docx_1.BorderStyle.SINGLE, size: 8, color: "CBD5E1" },
+                right: { style: docx_1.BorderStyle.SINGLE, size: 8, color: "CBD5E1" },
+                insideHorizontal: { style: docx_1.BorderStyle.SINGLE, size: 0, color: "FFFFFF" },
                 insideVertical: { style: docx_1.BorderStyle.SINGLE, size: 0, color: "FFFFFF" },
             },
             rows: [
@@ -58,7 +423,7 @@ class ReportService {
                             shading: {
                                 type: docx_1.ShadingType.CLEAR,
                                 color: "auto",
-                                fill: "FFFFFF",
+                                fill: "F8FAFC",
                             },
                             children,
                         }),
@@ -75,6 +440,20 @@ class ReportService {
                     text,
                     bold: true,
                     size: 24,
+                    color: "0F172A",
+                }),
+            ],
+        });
+    }
+    static buildExecutionItemTitleDocx(text) {
+        return new docx_1.Paragraph({
+            spacing: { after: 80 },
+            children: [
+                new docx_1.TextRun({
+                    text,
+                    bold: true,
+                    size: 22,
+                    color: "0F172A",
                 }),
             ],
         });
@@ -82,8 +461,277 @@ class ReportService {
     static buildDocxCardSectionTitle(text) {
         return new docx_1.Paragraph({
             spacing: { before: 120, after: 80 },
-            children: [new docx_1.TextRun({ text, bold: true })
+            children: [new docx_1.TextRun({ text, bold: true, color: "0F172A" })],
+        });
+    }
+    static buildCriteriaTableDocx(rows, headerTitle) {
+        const tableWidth = 9360;
+        const labelWidth = 2200;
+        const descWidth = tableWidth - labelWidth;
+        const tableRows = [];
+        // Header row que cobre toda a tabela (se fornecido)
+        if (headerTitle) {
+            tableRows.push(new docx_1.TableRow({
+                tableHeader: true,
+                children: [
+                    new docx_1.TableCell({
+                        width: { size: tableWidth, type: docx_1.WidthType.DXA },
+                        columnSpan: 2,
+                        margins: { top: 120, bottom: 120, left: 160, right: 160 },
+                        shading: { type: docx_1.ShadingType.CLEAR, color: "auto", fill: "1E3A5F" },
+                        children: [
+                            new docx_1.Paragraph({
+                                alignment: docx_1.AlignmentType.CENTER,
+                                children: [new docx_1.TextRun({ text: headerTitle, bold: true, color: "FFFFFF", size: 24 })],
+                            }),
+                        ],
+                    }),
+                ],
+            }));
+        }
+        // Data rows
+        rows.forEach((row) => {
+            tableRows.push(new docx_1.TableRow({
+                children: [
+                    new docx_1.TableCell({
+                        width: { size: labelWidth, type: docx_1.WidthType.DXA },
+                        margins: { top: 120, bottom: 120, left: 160, right: 160 },
+                        shading: {
+                            type: docx_1.ShadingType.CLEAR,
+                            color: "auto",
+                            fill: row.labelFill.replace(/^#/, ""),
+                        },
+                        children: [
+                            new docx_1.Paragraph({
+                                alignment: docx_1.AlignmentType.CENTER,
+                                children: [new docx_1.TextRun({ text: row.label, bold: true })],
+                            }),
+                        ],
+                    }),
+                    new docx_1.TableCell({
+                        width: { size: descWidth, type: docx_1.WidthType.DXA },
+                        margins: { top: 120, bottom: 120, left: 160, right: 160 },
+                        children: [
+                            new docx_1.Paragraph({
+                                children: [new docx_1.TextRun({ text: row.description })],
+                            }),
+                        ],
+                    }),
+                ],
+            }));
+        });
+        return new docx_1.Table({
+            layout: docx_1.TableLayoutType.FIXED,
+            width: { size: tableWidth, type: docx_1.WidthType.DXA },
+            columnWidths: [labelWidth, descWidth],
+            borders: {
+                top: { style: docx_1.BorderStyle.SINGLE, size: 8, color: "CBD5E1" },
+                bottom: { style: docx_1.BorderStyle.SINGLE, size: 8, color: "CBD5E1" },
+                left: { style: docx_1.BorderStyle.SINGLE, size: 8, color: "CBD5E1" },
+                right: { style: docx_1.BorderStyle.SINGLE, size: 8, color: "CBD5E1" },
+                insideHorizontal: { style: docx_1.BorderStyle.SINGLE, size: 8, color: "E2E8F0" },
+                insideVertical: { style: docx_1.BorderStyle.SINGLE, size: 8, color: "E2E8F0" },
+            },
+            rows: tableRows,
+        });
+    }
+    static buildCriticidadeTableDocx() {
+        return ReportService.buildCriteriaTableDocx([
+            {
+                label: "ALTA",
+                description: "Quando a deficiência comprometer de maneira significativa a efetividade do controle de PLD/FTP associado.",
+                labelFill: "#FEE2E2",
+            },
+            {
+                label: "MÉDIA",
+                description: "Quando a deficiência corresponder a inobservância de boa prática de PLD/FTP ou quando a deficiência comprometer parcialmente a efetividade do controle de PLD/FTP associado.",
+                labelFill: "#FEF9C3",
+            },
+            {
+                label: "BAIXA",
+                description: "Quando a deficiência não compromete a efetividade do controle de PLD/FTP associado.",
+                labelFill: "#DCFCE7",
+            },
+        ], "GRAU DE CRITICIDADE");
+    }
+    static buildEfetividadeTableDocx() {
+        return ReportService.buildCriteriaTableDocx([
+            {
+                label: "EFETIVO",
+                description: "Quando o programa de PLD/FTP atingir a maioria dos resultados esperados, sem a identificação de deficiências de alta criticidade nos procedimentos de monitoramento, seleção, análise e comunicação de operações atípicas, nos procedimentos de verificação de sanções CSNU, e nos procedimentos conheça seu cliente.",
+                labelFill: "#DCFCE7",
+            },
+            {
+                label: "PARCIALMENTE EFETIVO",
+                description: "Quando o programa de PLD/FTP atingir a maioria dos resultados esperados, com a identificação de algumas deficiências de alta criticidade nos procedimentos conheça seu cliente ou nos procedimentos de monitoramento, seleção, análise e comunicação de operações atípicas.",
+                labelFill: "#FEF9C3",
+            },
+            {
+                label: "POUCO EFETIVO",
+                description: "Quando o programa de PLD/FTP não atingir a maioria dos resultados esperados, com a identificação de deficiências de alta criticidade nos procedimentos de monitoramento, seleção, análise e comunicação de operações atípicas, nos procedimentos de verificação de sanções CSNU, e nos procedimentos conheça seu cliente.",
+                labelFill: "#FEE2E2",
+            },
+        ], "CRITÉRIOS DE AVALIAÇÃO DE EFETIVIDADE");
+    }
+    static buildConclusaoRows(sections) {
+        const rows = sections.map((section) => {
+            const label = (section?.customLabel || "").trim()
+                ? `${section.item} - ${section.customLabel}`
+                : section?.item || "-";
+            const counts = { baixa: 0, media: 0, alta: 0 };
+            (section?.questions || []).forEach((question) => {
+                if (question?.aplicavel === false)
+                    return;
+                // IMPORTANTE: Só conta se a resposta for "Não" (indica deficiência)
+                const resposta = (question?.resposta || "").toString().trim();
+                const respostaNormalized = resposta
+                    .toLowerCase()
+                    .normalize("NFD")
+                    .replace(/[\u0300-\u036f]/g, "");
+                const isRespostaNao = respostaNormalized === "nao" || respostaNormalized === "n";
+                // Se não for resposta "Não", não conta como deficiência
+                if (!isRespostaNao)
+                    return;
+                const crit = String(question?.criticidade || "").toUpperCase();
+                if (crit === "BAIXA")
+                    counts.baixa += 1;
+                else if (crit === "MEDIA" || crit === "MÉDIA")
+                    counts.media += 1;
+                else if (crit === "ALTA")
+                    counts.alta += 1;
+            });
+            const total = counts.baixa + counts.media + counts.alta;
+            return { label, ...counts, total };
+        });
+        const totalRow = rows.reduce((acc, row) => {
+            acc.baixa += row.baixa;
+            acc.media += row.media;
+            acc.alta += row.alta;
+            acc.total += row.total;
+            return acc;
+        }, { label: "TOTAL", baixa: 0, media: 0, alta: 0, total: 0 });
+        return [...rows, totalRow];
+    }
+    static buildConclusaoTableDocx(rows) {
+        const tableWidth = 9360;
+        const labelWidth = 5200;
+        const colWidth = Math.floor((tableWidth - labelWidth) / 4);
+        const baixaFill = "DCFCE7";
+        const mediaFill = "FEF9C3";
+        const altaFill = "FEE2E2";
+        const headerRow = new docx_1.TableRow({
+            children: [
+                new docx_1.TableCell({
+                    width: { size: labelWidth, type: docx_1.WidthType.DXA },
+                    shading: { type: docx_1.ShadingType.CLEAR, color: "auto", fill: "F1F5F9" },
+                    children: [
+                        new docx_1.Paragraph({
+                            children: [new docx_1.TextRun({ text: "Item avaliado", bold: true })],
+                        }),
+                    ],
+                }),
+                new docx_1.TableCell({
+                    width: { size: colWidth, type: docx_1.WidthType.DXA },
+                    shading: { type: docx_1.ShadingType.CLEAR, color: "auto", fill: baixaFill },
+                    children: [
+                        new docx_1.Paragraph({
+                            alignment: docx_1.AlignmentType.CENTER,
+                            children: [new docx_1.TextRun({ text: "BAIXA", bold: true })],
+                        }),
+                    ],
+                }),
+                new docx_1.TableCell({
+                    width: { size: colWidth, type: docx_1.WidthType.DXA },
+                    shading: { type: docx_1.ShadingType.CLEAR, color: "auto", fill: mediaFill },
+                    children: [
+                        new docx_1.Paragraph({
+                            alignment: docx_1.AlignmentType.CENTER,
+                            children: [new docx_1.TextRun({ text: "MÉDIA", bold: true })],
+                        }),
+                    ],
+                }),
+                new docx_1.TableCell({
+                    width: { size: colWidth, type: docx_1.WidthType.DXA },
+                    shading: { type: docx_1.ShadingType.CLEAR, color: "auto", fill: altaFill },
+                    children: [
+                        new docx_1.Paragraph({
+                            alignment: docx_1.AlignmentType.CENTER,
+                            children: [new docx_1.TextRun({ text: "ALTA", bold: true })],
+                        }),
+                    ],
+                }),
+                new docx_1.TableCell({
+                    width: { size: colWidth, type: docx_1.WidthType.DXA },
+                    shading: { type: docx_1.ShadingType.CLEAR, color: "auto", fill: "F1F5F9" },
+                    children: [
+                        new docx_1.Paragraph({
+                            alignment: docx_1.AlignmentType.CENTER,
+                            children: [new docx_1.TextRun({ text: "TOTAL", bold: true })],
+                        }),
+                    ],
+                }),
             ],
+        });
+        const bodyRows = rows.map((row) => new docx_1.TableRow({
+            children: [
+                new docx_1.TableCell({
+                    width: { size: labelWidth, type: docx_1.WidthType.DXA },
+                    children: [new docx_1.Paragraph({ text: row.label })],
+                }),
+                new docx_1.TableCell({
+                    width: { size: colWidth, type: docx_1.WidthType.DXA },
+                    shading: { type: docx_1.ShadingType.CLEAR, color: "auto", fill: baixaFill },
+                    children: [
+                        new docx_1.Paragraph({
+                            alignment: docx_1.AlignmentType.CENTER,
+                            text: String(row.baixa),
+                        }),
+                    ],
+                }),
+                new docx_1.TableCell({
+                    width: { size: colWidth, type: docx_1.WidthType.DXA },
+                    shading: { type: docx_1.ShadingType.CLEAR, color: "auto", fill: mediaFill },
+                    children: [
+                        new docx_1.Paragraph({
+                            alignment: docx_1.AlignmentType.CENTER,
+                            text: String(row.media),
+                        }),
+                    ],
+                }),
+                new docx_1.TableCell({
+                    width: { size: colWidth, type: docx_1.WidthType.DXA },
+                    shading: { type: docx_1.ShadingType.CLEAR, color: "auto", fill: altaFill },
+                    children: [
+                        new docx_1.Paragraph({
+                            alignment: docx_1.AlignmentType.CENTER,
+                            text: String(row.alta),
+                        }),
+                    ],
+                }),
+                new docx_1.TableCell({
+                    width: { size: colWidth, type: docx_1.WidthType.DXA },
+                    children: [
+                        new docx_1.Paragraph({
+                            alignment: docx_1.AlignmentType.CENTER,
+                            text: String(row.total),
+                        }),
+                    ],
+                }),
+            ],
+        }));
+        return new docx_1.Table({
+            layout: docx_1.TableLayoutType.FIXED,
+            width: { size: tableWidth, type: docx_1.WidthType.DXA },
+            columnWidths: [labelWidth, colWidth, colWidth, colWidth, colWidth],
+            borders: {
+                top: { style: docx_1.BorderStyle.SINGLE, size: 8, color: "94A3B8" },
+                bottom: { style: docx_1.BorderStyle.SINGLE, size: 8, color: "94A3B8" },
+                left: { style: docx_1.BorderStyle.SINGLE, size: 8, color: "94A3B8" },
+                right: { style: docx_1.BorderStyle.SINGLE, size: 8, color: "94A3B8" },
+                insideHorizontal: { style: docx_1.BorderStyle.SINGLE, size: 8, color: "94A3B8" },
+                insideVertical: { style: docx_1.BorderStyle.SINGLE, size: 8, color: "94A3B8" },
+            },
+            rows: [headerRow, ...bodyRows],
         });
     }
     static buildEvidenceLink(ev, baseUrl) {
@@ -124,6 +772,7 @@ class ReportService {
         }
         const requesterRole = (requester.requesterRole || requesterUser.role || "").toUpperCase();
         const requesterEmail = (requester.requesterEmail || requesterUser.email || "").toLowerCase();
+        const isAdminReport = requesterRole === "ADMIN" || requesterRole === "TRIAL_ADMIN";
         // Permissões:
         // - ADMIN pode gerar
         // - TRIAL_ADMIN pode gerar se for o dono do formulário
@@ -154,17 +803,24 @@ class ReportService {
         }
         const sections = Array.isArray(payload.sections) ? payload.sections : [];
         const metadata = payload.metadata || null;
-        const helpTexts = payload.helpTexts || null;
         const introInstituicoes = Array.isArray(metadata?.instituicoes)
             ? metadata.instituicoes
             : [];
+        const introInstituicoesInline = introInstituicoes.length
+            ? introInstituicoes
+                .map((inst) => `${((inst?.nome || "-") + "").trim()}${inst?.cnpj ? ` (CNPJ: ${inst.cnpj})` : ""}`)
+                .join(", ")
+            : "-";
         const introAvaliador = (metadata?.qualificacaoAvaliador || "").toString().trim();
-        const mostrarMetodologia = (metadata?.mostrarMetodologia || "MOSTRAR").toString();
         const incluirRecomendacoes = (metadata?.incluirRecomendacoes || "INCLUIR").toString();
+        const mostrarMetodologia = (metadata?.mostrarMetodologia || "MOSTRAR").toString().toUpperCase();
+        const deficiencias = ReportService.collectDeficiencias(sections);
+        const sectionLabels = ReportService.getSectionLabels(sections);
         const baseUrl = (process.env.PUBLIC_BASE_URL || "http://localhost:3001")
             .replace(/\/api\/?$/, "")
             .replace(/\/+$/, "");
         const generatedAt = new Date().toLocaleString("pt-BR");
+        const formCreatedAtText = ReportService.formatDatePtBr(new Date());
         const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
         const reportsDir = (0, paths_1.getReportsDir)();
         const title = "Relatório PLD";
@@ -195,155 +851,117 @@ class ReportService {
                             text: `Gerado por: ${requesterUser.name} <${requesterUser.email}>`,
                             break: 1,
                         }),
-                        new docx_1.TextRun({ text: `Formulário: ${formName}`, break: 1 }),
-                        new docx_1.TextRun({
-                            text: reportForm.assignedToEmail
-                                ? `Atribuído a: ${reportForm.assignedToEmail}`
-                                : "",
-                            break: reportForm.assignedToEmail ? 1 : 0,
-                        }),
                         new docx_1.TextRun({ text: `Data: ${generatedAt}`, break: 1 }),
                     ].filter(Boolean),
                 }),
-                new docx_1.Paragraph({ text: "Introdução", heading: docx_1.HeadingLevel.HEADING_1 }),
-                ...(introInstituicoes.length
-                    ? [
-                        new docx_1.Paragraph({
-                            spacing: { after: 120 },
-                            children: [new docx_1.TextRun({ text: "Instituição(ões)", bold: true })],
-                        }),
-                        ...introInstituicoes.map((inst) => new docx_1.Paragraph({
-                            bullet: { level: 0 },
-                            children: [
-                                new docx_1.TextRun({
-                                    text: `${((inst?.nome || "-") + "").trim()}${inst?.cnpj ? ` (CNPJ: ${inst.cnpj})` : ""}`,
-                                }),
-                            ],
-                        })),
-                    ]
-                    : [
-                        new docx_1.Paragraph({
-                            spacing: { after: 120 },
-                            children: [new docx_1.TextRun({ text: "Instituição(ões): -", bold: true })],
-                        }),
-                    ]),
+                ReportService.buildDocxFullWidthTitle("1- Introdução"),
                 new docx_1.Paragraph({
-                    spacing: { before: 120, after: 120 },
-                    children: [new docx_1.TextRun({ text: "Descrição do avaliador", bold: true })],
+                    text: "Conforme artigo 62 da Circular BCB nº 3.978, de 23 de janeiro de 2020, as instituições autorizadas a funcionar pelo Banco Central do Brasil devem avaliar anualmente a efetividade da política, dos procedimentos e dos controles internos por elas implementados para a prevenção à lavagem de dinheiro e ao financiamento do terrorismo.",
+                    spacing: { after: 160 },
                 }),
+                new docx_1.Paragraph({
+                    text: `Este relatório contém o resultado da avaliação dos diversos itens do programa de PLD/FTP das instituições ${introInstituicoesInline}.`,
+                    spacing: { after: 160 },
+                }),
+                new docx_1.Paragraph({
+                    text: "Para fins de elaboração deste relatório, Instituição será doravante adotado para designar ambas as instituições.",
+                    spacing: { after: 160 },
+                }),
+                new docx_1.Paragraph({
+                    text: "Em atendimento ao disposto no § 1º do artigo 62 da Circular BCB nº 3.978/20, este relatório descreve a metodologia empregada nessa avaliação, os testes aplicados, a qualificação do avaliador, os itens avaliados e o resultado dessa avaliação (deficiências identificadas).",
+                    spacing: { after: 160 },
+                }),
+                new docx_1.Paragraph({
+                    text: `A avaliação considerou o programa de PLD/FTP vigente em ${formCreatedAtText}.`,
+                    spacing: { after: 160 },
+                }),
+                ReportService.buildDocxFullWidthTitle("2- Metodologia de Avaliação"),
+                new docx_1.Paragraph({
+                    text: "A metodologia de avaliação consistiu na:",
+                    spacing: { after: 120 },
+                }),
+                ...[
+                    "verificação da existência, formalização, conteúdo, atualização e, quando for o caso, a divulgação dos documentos exigidos expressamente na Circular BCB nº 3.978/20:",
+                ].map((item) => new docx_1.Paragraph({
+                    bullet: { level: 0 },
+                    text: item,
+                })),
+                ...[
+                    "Política de PLD/FTP;",
+                    "Manual de Procedimentos Conheça seu Cliente;",
+                    "Manual de Procedimentos de Monitoramento, Seleção, Análise e Comunicação de Operações Suspeitas (Procedimentos MSAC);",
+                    "Procedimentos Conheça seu Funcionário;",
+                    "Procedimentos Conheça seu Parceiro;",
+                    "Procedimentos Conheça seu Prestador de Serviço Terceirizado;",
+                    "Relatório de Avaliação Interna de Risco",
+                    "Relatório de Avaliação de Efetividade do ano anterior;",
+                    "Plano de Ação para correção das deficiências identificadas no Relatório de Avaliação de Efetividade do ano anterior;",
+                    "Relatório de Acompanhamento do Plano de Ação;",
+                ].map((item) => new docx_1.Paragraph({
+                    bullet: { level: 1 },
+                    text: item,
+                })),
+                ...[
+                    "avaliação da estrutura e dos procedimentos de governança de PLD/FTP;",
+                    "avaliação do programa de treinamento em PLD/FTP e das ações de promoção da cultura organizacional de PLD/FTP;",
+                    "avaliação dos procedimentos MSAC, incluindo a adequação da área de PLD/FTP;",
+                    "avaliação dos procedimentos relacionados ao cumprimento das disposições da Lei nº 13.810/19, regulamentados pela Resolução BCB nº 44/20 e Instrução Normativa BCB nº 262/22;",
+                    "avaliação dos procedimentos antifraude;",
+                    "avaliação dos mecanismos de acompanhamento e de controle de que trata o Capítulo X da Circular BCB nº 3.978/20, incluindo auditoria interna;",
+                    "realização de testes com o propósito de verificar a aderência dos procedimentos vigentes em relação ao disposto nos documentos internos, por meio de: entrevistas; requisição de evidências; amostragem; acompanhamento, por meio de reuniões remotas, da execução dos procedimentos e controles de PLD/FTP pelos responsáveis diretos por tal execução; e na análise de relatórios gerenciais e de estatísticas relativas ao sistema de monitoramento e aos procedimentos conheça seu cliente.",
+                ].map((item) => new docx_1.Paragraph({
+                    bullet: { level: 0 },
+                    text: item,
+                })),
+                new docx_1.Paragraph({
+                    text: "Os itens avaliados do programa de PLD/FTP da Instituição foram:",
+                    spacing: { before: 120, after: 80 },
+                }),
+                ...(sectionLabels.length > 0
+                    ? sectionLabels.map((label, idx) => new docx_1.Paragraph({
+                        bullet: { level: 0 },
+                        text: `${idx + 1}. ${label}`,
+                    }))
+                    : [new docx_1.Paragraph({ text: "-" })]),
+                new docx_1.Paragraph({
+                    text: "A descrição detalhada da avaliação de cada item, incluindo os testes realizados, consta no item EXECUÇÃO.",
+                    spacing: { before: 160, after: 120 },
+                }),
+                new docx_1.Paragraph({
+                    text: "Como resultado dessa avaliação, a deficiência identificada recebeu um grau de criticidade definido conforme tabela abaixo.",
+                    spacing: { after: 120 },
+                }),
+                ReportService.buildCriticidadeTableDocx(),
+                new docx_1.Paragraph({
+                    text: "O resultado da avaliação de efetividade resultará na atribuição de um dos conceitos, mostrados a seguir, ao programa de PLD/FTP da Instituição.",
+                    spacing: { before: 200, after: 160 },
+                }),
+                ReportService.buildEfetividadeTableDocx(),
+                new docx_1.Paragraph({ text: "", spacing: { after: 400 } }),
+                ReportService.buildDocxFullWidthTitle("3- Qualificação do Avaliador"),
                 new docx_1.Paragraph({ text: introAvaliador || "-", spacing: { after: 160 } }),
-                new docx_1.Paragraph({ text: "Configurações", heading: docx_1.HeadingLevel.HEADING_1 }),
-                ReportService.buildDocxCard([
-                    ReportService.buildLabelValueParagraph("Metodologia - Resultado da Avaliação", mostrarMetodologia === "MOSTRAR" ? "MOSTRAR" : "NÃO MOSTRAR"),
-                    ReportService.buildLabelValueParagraph("Recomendações", incluirRecomendacoes === "INCLUIR" ? "INCLUIR" : "NÃO INCLUIR", { spacingAfter: 0 }),
-                ]),
-                new docx_1.Paragraph({ text: "", spacing: { after: 200 } }),
+                ReportService.buildDocxFullWidthTitle("4- Execução"),
             ];
-            if (mostrarMetodologia === "MOSTRAR") {
-                children.push(new docx_1.Paragraph({
-                    text: "Metodologia - Resultado da Avaliação",
-                    heading: docx_1.HeadingLevel.HEADING_1,
-                }));
-                const metodologiaTexto = typeof helpTexts?.metodologia === "string" ? helpTexts.metodologia.trim() : "";
-                children.push(new docx_1.Paragraph({ text: metodologiaTexto || "-", spacing: { after: 200 } }));
-            }
-            sections.forEach((section) => {
+            sections.forEach((section, sectionIndex) => {
                 const sectionLabel = (section?.customLabel || "").trim()
                     ? `${section.item} - ${section.customLabel}`
                     : section.item;
-                children.push(new docx_1.Paragraph({ text: sectionLabel || "-", heading: docx_1.HeadingLevel.HEADING_1 }));
-                if (section?.descricao) {
-                    children.push(new docx_1.Paragraph({ text: String(section.descricao), spacing: { after: 160 } }));
+                const itemPrefix = `4.${sectionIndex + 1}`;
+                children.push(ReportService.buildExecutionItemTitleDocx(`${itemPrefix} ${sectionLabel || "-"}`));
+                if (isAdminReport) {
+                    children.push(ReportService.buildLabelValueParagraph("Descrição do item avaliado", section?.descricao ? String(section.descricao) : "-", { spacingAfter: 160 }));
                 }
-                if (typeof section?.hasNorma === "boolean") {
-                    children.push(ReportService.buildDocxCard([
-                        ReportService.buildLabelValueParagraph("Possui norma interna", section.hasNorma ? "Sim" : "Não"),
-                        ReportService.buildLabelValueParagraph("Norma (referência)", section.normaReferencia ? String(section.normaReferencia) : "-", { spacingAfter: 0 }),
-                    ]));
-                    children.push(new docx_1.Paragraph({ text: "", spacing: { after: 160 } }));
-                }
-                const normaFiles = (section?.attachments || []).filter((a) => a?.category === "NORMA");
-                const uniqueNormaFiles = Array.from(normaFiles
-                    .reduce((acc, att) => {
-                    acc.set(`${att.category}|${att.path}`, att);
-                    return acc;
-                }, new Map())
-                    .values());
-                if (uniqueNormaFiles.length > 0) {
-                    const normaCard = [
-                        new docx_1.Paragraph({
-                            children: [new docx_1.TextRun({ text: "Norma interna (arquivos)", bold: true })],
-                            spacing: { after: 120 },
-                        }),
-                    ];
-                    uniqueNormaFiles.forEach((att) => {
-                        const link = ReportService.buildBuilderAttachmentLink(att, baseUrl);
-                        normaCard.push(new docx_1.Paragraph({
-                            bullet: { level: 0 },
-                            children: [
-                                new docx_1.ExternalHyperlink({
-                                    link,
-                                    children: [
-                                        new docx_1.TextRun({
-                                            text: att.originalName || att.filename || "Arquivo",
-                                            style: "Hyperlink",
-                                            color: "0563C1",
-                                            underline: {},
-                                        }),
-                                    ],
-                                }),
-                            ],
-                        }));
-                    });
-                    children.push(ReportService.buildDocxCard(normaCard));
-                    children.push(new docx_1.Paragraph({ text: "", spacing: { after: 160 } }));
-                }
+                const sectionDeficiencias = deficiencias.filter((def) => def.sectionLabel === (sectionLabel || "-"));
                 (section?.questions || []).forEach((question, index) => {
+                    const showTestDetails = String(question?.testStatus || "").toUpperCase() === "SIM";
                     const card = [
-                        ReportService.buildDocxCardTitle(`${index + 1}. ${ReportService.sanitizeQuestionTitle(question?.texto)}`),
-                        ReportService.buildLabelValueParagraph("Aplicável", question?.aplicavel ? "Sim" : "Não"),
+                        ...(showTestDetails
+                            ? [
+                                ReportService.buildLabelValueParagraph("Teste (descrição)", question?.testDescription ? String(question.testDescription) : "-"),
+                                ReportService.buildLabelValueParagraph("Resposta do Teste", question?.respostaTesteRef ? String(question.respostaTesteRef) : "-"),
+                            ]
+                            : []),
                     ];
-                    if (question?.capitulacao)
-                        card.push(ReportService.buildLabelValueParagraph("Capitulação", String(question.capitulacao)));
-                    if (question?.criticidade)
-                        card.push(ReportService.buildLabelValueParagraph("Criticidade", String(question.criticidade)));
-                    if (question?.resposta)
-                        card.push(ReportService.buildLabelValueParagraph("Resposta", String(question.resposta)));
-                    if (question?.respostaTexto)
-                        card.push(ReportService.buildLabelValueParagraph("Resposta (texto)", String(question.respostaTexto)));
-                    if (question?.deficienciaTexto)
-                        card.push(ReportService.buildLabelValueParagraph("Deficiência", String(question.deficienciaTexto)));
-                    if (incluirRecomendacoes === "INCLUIR" && question?.recomendacaoTexto)
-                        card.push(ReportService.buildLabelValueParagraph("Recomendação", String(question.recomendacaoTexto)));
-                    if (question?.testStatus)
-                        card.push(ReportService.buildLabelValueParagraph("Teste (status)", String(question.testStatus)));
-                    if (question?.testDescription)
-                        card.push(ReportService.buildLabelValueParagraph("Teste (descrição)", String(question.testDescription)));
-                    if (question?.requisicaoRef)
-                        card.push(ReportService.buildLabelValueParagraph("Referência (requisição)", String(question.requisicaoRef)));
-                    if (question?.respostaTesteRef)
-                        card.push(ReportService.buildLabelValueParagraph("Referência (resposta do teste)", String(question.respostaTesteRef)));
-                    if (question?.amostraRef)
-                        card.push(ReportService.buildLabelValueParagraph("Referência (amostra)", String(question.amostraRef)));
-                    if (question?.evidenciasRef)
-                        card.push(ReportService.buildLabelValueParagraph("Referência (evidências)", String(question.evidenciasRef)));
-                    if (question?.actionOrigem)
-                        card.push(ReportService.buildLabelValueParagraph("Ação (origem)", String(question.actionOrigem)));
-                    if (question?.actionResponsavel)
-                        card.push(ReportService.buildLabelValueParagraph("Ação (responsável)", String(question.actionResponsavel)));
-                    if (question?.actionDescricao)
-                        card.push(ReportService.buildLabelValueParagraph("Ação (descrição)", String(question.actionDescricao)));
-                    const dataAp = safeDate(question?.actionDataApontamento);
-                    if (dataAp)
-                        card.push(ReportService.buildLabelValueParagraph("Ação (data apontamento)", dataAp.toLocaleDateString("pt-BR")));
-                    const prazoOrig = safeDate(question?.actionPrazoOriginal);
-                    if (prazoOrig)
-                        card.push(ReportService.buildLabelValueParagraph("Ação (prazo original)", prazoOrig.toLocaleDateString("pt-BR")));
-                    const prazoAt = safeDate(question?.actionPrazoAtual);
-                    if (prazoAt)
-                        card.push(ReportService.buildLabelValueParagraph("Ação (prazo atual)", prazoAt.toLocaleDateString("pt-BR")));
-                    if (question?.actionComentarios)
-                        card.push(ReportService.buildLabelValueParagraph("Ação (comentários)", String(question.actionComentarios)));
                     const atts = Array.isArray(question?.attachments) ? question.attachments : [];
                     const uniqueAtts = Array.from(atts
                         .reduce((acc, att) => {
@@ -351,41 +969,122 @@ class ReportService {
                         return acc;
                     }, new Map())
                         .values());
-                    if (uniqueAtts.length > 0) {
-                        card.push(ReportService.buildDocxCardSectionTitle("Arquivos"));
-                        uniqueAtts.forEach((att) => {
-                            const link = ReportService.buildBuilderAttachmentLink(att, baseUrl);
-                            card.push(new docx_1.Paragraph({
-                                bullet: { level: 0 },
-                                children: [
-                                    new docx_1.TextRun({ text: `[${att.category}] ` }),
-                                    new docx_1.ExternalHyperlink({
-                                        link,
-                                        children: [
-                                            new docx_1.TextRun({
-                                                text: att.originalName || att.filename || "Arquivo",
-                                                style: "Hyperlink",
-                                                color: "0563C1",
-                                                underline: {},
-                                            }),
-                                        ],
-                                    }),
-                                ],
-                            }));
-                            if (att.referenceText) {
+                    // Todos os grupos de arquivos
+                    const attachmentGroups = [
+                        {
+                            label: "Requisição",
+                            categories: ["TEST_REQUISICAO", "TESTE_REQUISICAO"],
+                        },
+                        {
+                            label: "Resposta",
+                            categories: ["TEST_RESPOSTA", "TESTE_RESPOSTA"],
+                        },
+                        {
+                            label: "Amostra",
+                            categories: ["TEST_AMOSTRA", "TESTE_AMOSTRA"],
+                        },
+                        {
+                            label: "Evidências",
+                            categories: ["TEST_EVIDENCIAS", "TESTE_EVIDENCIAS"],
+                        },
+                    ];
+                    if (showTestDetails) {
+                        attachmentGroups.forEach((group) => {
+                            const groupAtts = uniqueAtts.filter((att) => group.categories.includes(att.category));
+                            if (groupAtts.length === 0)
+                                return;
+                            card.push(ReportService.buildDocxCardSectionTitle(`Arquivos - ${group.label}`));
+                            groupAtts.forEach((att) => {
                                 card.push(new docx_1.Paragraph({
-                                    indent: { left: 360 },
-                                    children: [new docx_1.TextRun({ text: `Referência: ${att.referenceText}` })],
+                                    bullet: { level: 0 },
+                                    children: [new docx_1.TextRun({ text: att.originalName || att.filename || "Arquivo" })],
                                 }));
-                            }
+                            });
                         });
                     }
                     children.push(ReportService.buildDocxCard(card));
                     children.push(new docx_1.Paragraph({ text: "", spacing: { after: 160 } }));
                 });
+                children.push(new docx_1.Paragraph({
+                    text: `${itemPrefix}.1 Apontamentos`,
+                    heading: docx_1.HeadingLevel.HEADING_3,
+                }));
+                if (sectionDeficiencias.length === 0) {
+                    children.push(new docx_1.Paragraph({
+                        text: "Nenhuma deficiência identificada.",
+                        spacing: { after: 160 },
+                    }));
+                }
+                else {
+                    sectionDeficiencias.forEach((def, defIndex) => {
+                        children.push(new docx_1.Paragraph({
+                            spacing: { after: 80 },
+                            children: [
+                                new docx_1.TextRun({
+                                    text: `${defIndex + 1}. Deficiência: ${def.deficiencia}`,
+                                    bold: true,
+                                }),
+                            ],
+                        }));
+                        if (def.criticidade) {
+                            children.push(new docx_1.Paragraph({
+                                children: [new docx_1.TextRun({ text: `Criticidade: ${def.criticidade}` })],
+                            }));
+                        }
+                        if (incluirRecomendacoes === "INCLUIR" && def.recomendacao) {
+                            children.push(new docx_1.Paragraph({
+                                children: [new docx_1.TextRun({ text: `Recomendação: ${def.recomendacao}` })],
+                            }));
+                        }
+                        children.push(new docx_1.Paragraph({ text: "", spacing: { after: 120 } }));
+                    });
+                }
                 children.push(new docx_1.Paragraph({ text: "", spacing: { after: 200 } }));
             });
+            const conclusaoRows = ReportService.buildConclusaoRows(sections);
+            children.push(ReportService.buildDocxFullWidthTitle("5- CONCLUSÃO"));
+            children.push(new docx_1.Paragraph({
+                text: "A tabela abaixo mostra a relação de deficiências e respectiva criticidade identificadas como resultado da avaliação dos diversos itens do Programa de PLD/FTP da Instituição.",
+                spacing: { after: 120 },
+            }));
+            children.push(ReportService.buildConclusaoTableDocx(conclusaoRows));
+            // Resultado da Avaliação (user form DOCX) - renderizado apenas se mostrarMetodologia === 'MOSTRAR'
+            if (mostrarMetodologia === "MOSTRAR") {
+                const resultadoAvaliacao = ReportService.calcularResultadoAvaliacao(sections);
+                children.push(new docx_1.Paragraph({
+                    text: "Resultado da Avaliação",
+                    heading: docx_1.HeadingLevel.HEADING_2,
+                    spacing: { before: 240, after: 120 },
+                }));
+                children.push(new docx_1.Paragraph({
+                    children: [
+                        new docx_1.TextRun({ text: "Resultado: ", bold: true }),
+                        new docx_1.TextRun({ text: resultadoAvaliacao.resultado }),
+                    ],
+                    spacing: { after: 80 },
+                }));
+                children.push(new docx_1.Paragraph({
+                    text: resultadoAvaliacao.descricao,
+                    spacing: { after: 200 },
+                }));
+            }
+            else {
+                children.push(new docx_1.Paragraph({ text: "", spacing: { after: 200 } }));
+            }
+            const evidenceRows = ReportService.buildEvidenceAnnexRows(sections, "4", baseUrl);
+            children.push(ReportService.buildDocxFullWidthTitle("6- ANEXO EVIDÊNCIAS"));
+            children.push(new docx_1.Paragraph({
+                text: "A tabela abaixo apresenta os itens avaliados e todos os arquivos enviados (norma e demais anexos) relacionados às questões.",
+                spacing: { after: 120 },
+            }));
+            if (evidenceRows.length > 0) {
+                children.push(ReportService.buildEvidenceAnnexTableDocx(evidenceRows));
+            }
+            else {
+                children.push(new docx_1.Paragraph({ text: "-", spacing: { after: 120 } }));
+            }
             const doc = new docx_1.Document({
+                styles: ReportService.buildDocxStyles(),
                 sections: [
                     {
                         properties: {},
@@ -462,6 +1161,15 @@ class ReportService {
                 .text(text, marginLeft, pdf.y, { width: contentWidth });
             pdf.moveDown(0.4);
         };
+        const h2Item = (text) => {
+            ensureSpace(28);
+            pdf
+                .fillColor(textDark)
+                .font("Helvetica-Bold")
+                .fontSize(13)
+                .text(text, marginLeft, pdf.y, { width: contentWidth });
+            pdf.moveDown(0.35);
+        };
         const h3 = (text) => {
             ensureSpace(24);
             pdf
@@ -500,6 +1208,112 @@ class ReportService {
                 .fontSize(fontSize)
                 .heightOfString(text || "-", { width, lineGap });
         };
+        const titleBlock = (text, align = "left") => {
+            ensureSpace(28);
+            const paddingX = 8;
+            const paddingY = 6;
+            const textHeight = measureTextHeight(text, {
+                width: contentWidth - paddingX * 2,
+                font: "Helvetica-Bold",
+                fontSize: 11,
+                lineGap: 2,
+            });
+            const boxHeight = textHeight + paddingY * 2;
+            const startY = pdf.y;
+            pdf.save();
+            pdf.fillColor("#E2E8F0").rect(marginLeft, startY, contentWidth, boxHeight).fill();
+            pdf
+                .fillColor(textDark)
+                .font("Helvetica-Bold")
+                .fontSize(11)
+                .text(text, marginLeft + paddingX, startY + paddingY, {
+                width: contentWidth - paddingX * 2,
+                align,
+            });
+            pdf.restore();
+            pdf.y = startY + boxHeight + 6;
+        };
+        const bulletItem = (text) => {
+            ensureSpace(18);
+            pdf
+                .fillColor(textMuted)
+                .font("Helvetica")
+                .fontSize(10.5)
+                .text(`• ${text}`, marginLeft + 10, pdf.y, {
+                width: contentWidth - 10,
+                lineGap: 2,
+            });
+            pdf.moveDown(0.2);
+        };
+        const bulletItemSecondary = (text) => {
+            ensureSpace(18);
+            pdf
+                .fillColor(textMuted)
+                .font("Helvetica")
+                .fontSize(10.5)
+                .text(`- ${text}`, marginLeft + 24, pdf.y, {
+                width: contentWidth - 24,
+                lineGap: 2,
+            });
+            pdf.moveDown(0.2);
+        };
+        const drawCriteriaTable = (rows) => {
+            const labelWidth = 120;
+            const descWidth = contentWidth - labelWidth;
+            const paddingX = 6;
+            const paddingY = 6;
+            rows.forEach((row) => {
+                const labelHeight = measureTextHeight(row.label, {
+                    width: labelWidth - paddingX * 2,
+                    font: "Helvetica-Bold",
+                    fontSize: 10,
+                    lineGap: 1,
+                });
+                const descHeight = measureTextHeight(row.description, {
+                    width: descWidth - paddingX * 2,
+                    font: "Helvetica",
+                    fontSize: 10,
+                    lineGap: 2,
+                });
+                const rowHeight = Math.max(labelHeight, descHeight) + paddingY * 2;
+                ensureSpace(rowHeight + 6);
+                const startY = pdf.y;
+                pdf.save();
+                pdf.fillColor(row.labelFill).rect(marginLeft, startY, labelWidth, rowHeight).fill();
+                pdf
+                    .fillColor("#FFFFFF")
+                    .rect(marginLeft + labelWidth, startY, descWidth, rowHeight)
+                    .fill();
+                pdf.restore();
+                pdf
+                    .strokeColor(lineColor)
+                    .rect(marginLeft, startY, contentWidth, rowHeight)
+                    .stroke();
+                pdf
+                    .strokeColor(lineColor)
+                    .moveTo(marginLeft + labelWidth, startY)
+                    .lineTo(marginLeft + labelWidth, startY + rowHeight)
+                    .stroke();
+                pdf
+                    .fillColor(textDark)
+                    .font("Helvetica-Bold")
+                    .fontSize(10)
+                    .text(row.label, marginLeft + paddingX, startY + paddingY, {
+                    width: labelWidth - paddingX * 2,
+                    lineGap: 1,
+                });
+                pdf
+                    .fillColor(textMuted)
+                    .font("Helvetica")
+                    .fontSize(10)
+                    .text(row.description, marginLeft + labelWidth + paddingX, startY + paddingY, {
+                    width: descWidth - paddingX * 2,
+                    lineGap: 2,
+                });
+                pdf.y = startY + rowHeight;
+            });
+            pdf.moveDown(0.6);
+        };
         h1(title);
         pdf
             .fillColor(textMuted)
@@ -508,38 +1322,95 @@ class ReportService {
             .text(`Gerado por: ${requesterUser.name} <${requesterUser.email}>`, {
             align: "center",
         });
-        pdf.text(`Formulário: ${formName}`, { align: "center" });
-        if (reportForm.assignedToEmail) {
-            pdf.text(`Atribuído a: ${reportForm.assignedToEmail}`, { align: "center" });
-        }
         pdf.text(`Data: ${generatedAt}`, { align: "center" });
         pdf.moveDown(1.0);
         hr();
-        h2("Introdução");
-        if (introInstituicoes.length > 0) {
-            h3("Instituição(ões)");
-            introInstituicoes.forEach((inst, idx) => {
-                const nome = ((inst?.nome || "-") + "").trim() || "-";
-                const cnpj = ((inst?.cnpj || "") + "").trim();
-                p(`${idx + 1}. ${nome}${cnpj ? ` (CNPJ: ${cnpj})` : ""}`);
+        titleBlock("1- Introdução");
+        p("Conforme artigo 62 da Circular BCB nº 3.978, de 23 de janeiro de 2020, as instituições autorizadas a funcionar pelo Banco Central do Brasil devem avaliar anualmente a efetividade da política, dos procedimentos e dos controles internos por elas implementados para a prevenção à lavagem de dinheiro e ao financiamento do terrorismo.");
+        p(`Este relatório contém o resultado da avaliação dos diversos itens do programa de PLD/FTP das instituições ${introInstituicoesInline}.`);
+        p("Para fins de elaboração deste relatório, Instituição será doravante adotado para designar ambas as instituições.");
+        p("Em atendimento ao disposto no § 1º do artigo 62 da Circular BCB nº 3.978/20, este relatório descreve a metodologia empregada nessa avaliação, os testes aplicados, a qualificação do avaliador, os itens avaliados e o resultado dessa avaliação (deficiências identificadas).");
+        p(`A avaliação considerou o programa de PLD/FTP vigente em ${formCreatedAtText}.`);
+        hr();
+        titleBlock("2- Metodologia de Avaliação");
+        p("A metodologia de avaliação consistiu na:");
+        [
+            "verificação da existência, formalização, conteúdo, atualização e, quando for o caso, a divulgação dos documentos exigidos expressamente na Circular BCB nº 3.978/20:",
+        ].forEach(bulletItem);
+        [
+            "Política de PLD/FTP;",
+            "Manual de Procedimentos Conheça seu Cliente;",
+            "Manual de Procedimentos de Monitoramento, Seleção, Análise e Comunicação de Operações Suspeitas (Procedimentos MSAC);",
+            "Procedimentos Conheça seu Funcionário;",
+            "Procedimentos Conheça seu Parceiro;",
+            "Procedimentos Conheça seu Prestador de Serviço Terceirizado;",
+            "Relatório de Avaliação Interna de Risco",
+            "Relatório de Avaliação de Efetividade do ano anterior;",
+            "Plano de Ação para correção das deficiências identificadas no Relatório de Avaliação de Efetividade do ano anterior;",
+            "Relatório de Acompanhamento do Plano de Ação;",
+        ].forEach(bulletItemSecondary);
+        [
+            "avaliação da estrutura e dos procedimentos de governança de PLD/FTP;",
+            "avaliação do programa de treinamento em PLD/FTP e das ações de promoção da cultura organizacional de PLD/FTP;",
+            "avaliação dos procedimentos MSAC, incluindo a adequação da área de PLD/FTP;",
+            "avaliação dos procedimentos relacionados ao cumprimento das disposições da Lei nº 13.810/19, regulamentados pela Resolução BCB nº 44/20 e Instrução Normativa BCB nº 262/22;",
+            "avaliação dos procedimentos antifraude;",
+            "avaliação dos mecanismos de acompanhamento e de controle de que trata o Capítulo X da Circular BCB nº 3.978/20, incluindo auditoria interna;",
+            "realização de testes com o propósito de verificar a aderência dos procedimentos vigentes em relação ao disposto nos documentos internos, por meio de: entrevistas; requisição de evidências; amostragem; acompanhamento, por meio de reuniões remotas, da execução dos procedimentos e controles de PLD/FTP pelos responsáveis diretos por tal execução; e na análise de relatórios gerenciais e de estatísticas relativas ao sistema de monitoramento e aos procedimentos conheça seu cliente.",
+        ].forEach(bulletItem);
+        p("Os itens avaliados do programa de PLD/FTP da Instituição foram:");
+        if (sectionLabels.length > 0) {
+            sectionLabels.forEach((label, idx) => {
+                bulletItem(`${idx + 1}. ${label}`);
             });
         }
         else {
-            p("Instituição(ões): -");
+            p("-");
         }
-        h3("Descrição do avaliador");
+        p("A descrição detalhada da avaliação de cada item, incluindo os testes realizados, consta no item EXECUÇÃO.");
+        p("Como resultado dessa avaliação, a deficiência identificada recebeu um grau de criticidade definido conforme tabela abaixo.");
+        titleBlock("GRAU DE CRITICIDADE", "center");
+        drawCriteriaTable([
+            {
+                label: "ALTA",
+                description: "Quando a deficiência comprometer de maneira significativa a efetividade do controle de PLD/FTP associado.",
+                labelFill: "#FEE2E2",
+            },
+            {
+                label: "MÉDIA",
+                description: "Quando a deficiência corresponder a inobservância de boa prática de PLD/FTP ou quando a deficiência comprometer parcialmente a efetividade do controle de PLD/FTP associado.",
+                labelFill: "#FEF9C3",
+            },
+            {
+                label: "BAIXA",
+                description: "Quando a deficiência não compromete a efetividade do controle de PLD/FTP associado.",
+                labelFill: "#DCFCE7",
+            },
+        ]);
+        p("O resultado da avaliação de efetividade resultará na atribuição de um dos conceitos, mostrados a seguir, ao programa de PLD/FTP da Instituição.");
+        titleBlock("CRITÉRIOS DE AVALIAÇÃO DE EFETIVIDADE", "center");
+        drawCriteriaTable([
+            {
+                label: "EFETIVO",
+                description: "Quando o programa de PLD/FTP atingir a maioria dos resultados esperados, sem a identificação de deficiências de alta criticidade nos procedimentos de monitoramento, seleção, análise e comunicação de operações atípicas, nos procedimentos de verificação de sanções CSNU, e nos procedimentos conheça seu cliente.",
+                labelFill: "#DCFCE7",
+            },
+            {
+                label: "PARCIALMENTE EFETIVO",
+                description: "Quando o programa de PLD/FTP atingir a maioria dos resultados esperados, com a identificação de algumas deficiências de alta criticidade nos procedimentos conheça seu cliente ou nos procedimentos de monitoramento, seleção, análise e comunicação de operações atípicas.",
+                labelFill: "#FEF9C3",
+            },
+            {
+                label: "POUCO EFETIVO",
+                description: "Quando o programa de PLD/FTP não atingir a maioria dos resultados esperados, com a identificação de deficiências de alta criticidade nos procedimentos de monitoramento, seleção, análise e comunicação de operações atípicas, nos procedimentos de verificação de sanções CSNU, e nos procedimentos conheça seu cliente.",
+                labelFill: "#FEE2E2",
+            },
+        ]);
+        hr();
+        titleBlock("3- Qualificação do Avaliador");
         p(introAvaliador || "-");
         hr();
-        h2("Configurações");
-        kv("Metodologia - Resultado da Avaliação", mostrarMetodologia === "MOSTRAR" ? "MOSTRAR" : "NÃO MOSTRAR");
-        kv("Recomendações", incluirRecomendacoes === "INCLUIR" ? "INCLUIR" : "NÃO INCLUIR");
-        hr();
-        if (mostrarMetodologia === "MOSTRAR") {
-            h2("Metodologia - Resultado da Avaliação");
-            const metodologiaTexto = typeof helpTexts?.metodologia === "string" ? helpTexts.metodologia.trim() : "";
-            p(metodologiaTexto || "-");
-            hr();
-        }
+        titleBlock("4- Execução");
         sections.forEach((section, sectionIndex) => {
             if (sectionIndex > 0) {
                 pdf.addPage();
@@ -547,41 +1418,13 @@ class ReportService {
             const sectionLabel = (section?.customLabel || "").trim()
                 ? `${section.item} - ${section.customLabel}`
                 : section.item;
-            h2(sectionLabel || "-");
-            if (section?.descricao) {
-                p(String(section.descricao));
-            }
-            if (typeof section?.hasNorma === "boolean") {
-                kv("Possui norma interna", section.hasNorma ? "Sim" : "Não");
-                kv("Norma (referência)", section.normaReferencia ? String(section.normaReferencia) : "-");
+            const itemPrefix = `4.${sectionIndex + 1}`;
+            h2Item(`${itemPrefix} ${sectionLabel || "-"}`);
+            if (isAdminReport) {
+                kv("Descrição do item avaliado", section?.descricao ? String(section.descricao) : "-");
                 pdf.moveDown(0.4);
             }
-            const normaFiles = (section?.attachments || []).filter((a) => a?.category === "NORMA");
-            const uniqueNormaFiles = Array.from(normaFiles
-                .reduce((acc, att) => {
-                acc.set(`${att.category}|${att.path}`, att);
-                return acc;
-            }, new Map())
-                .values());
-            if (uniqueNormaFiles.length > 0) {
-                h3("Norma interna (arquivos)");
-                uniqueNormaFiles.forEach((att, idx) => {
-                    ensureSpace(18);
-                    const link = ReportService.buildBuilderAttachmentLink(att, baseUrl);
-                    pdf
-                        .fillColor(linkColor)
-                        .font("Helvetica")
-                        .fontSize(10.5)
-                        .text(`${idx + 1}. ${att.originalName || att.filename || "Arquivo"}`, marginLeft, pdf.y, {
-                        width: contentWidth,
-                        link,
-                        underline: true,
-                        lineGap: 2,
-                    });
-                    pdf.fillColor(textMuted);
-                });
-                pdf.moveDown(0.6);
-            }
+            const sectionDeficiencias = deficiencias.filter((def) => def.sectionLabel === (sectionLabel || "-"));
             hr();
             (section?.questions || []).forEach((question, index) => {
                 const boxX = marginLeft;
@@ -590,52 +1433,36 @@ class ReportService {
                 const boxPaddingY = 14;
                 const innerX = boxX + boxPaddingX;
                 const innerW = boxW - boxPaddingX * 2;
+                const showTestDetails = String(question?.testStatus || "").toUpperCase() === "SIM";
                 const plannedLines = [
-                    { label: "Aplicável", value: question?.aplicavel ? "Sim" : "Não" },
-                    { label: "Capitulação", value: question?.capitulacao },
-                    {
-                        label: "Criticidade",
-                        value: question?.criticidade != null ? String(question.criticidade) : undefined,
-                    },
-                    { label: "Resposta", value: question?.resposta },
-                    { label: "Resposta (texto)", value: question?.respostaTexto },
-                    { label: "Deficiência", value: question?.deficienciaTexto },
-                    ...(incluirRecomendacoes === "INCLUIR"
-                        ? [{ label: "Recomendação", value: question?.recomendacaoTexto }]
+                    ...(showTestDetails
+                        ? [
+                            {
+                                label: "Teste (descrição)",
+                                value: question?.testDescription ? String(question.testDescription) : "-",
+                            },
+                            {
+                                label: "Referência (requisição)",
+                                value: question?.requisicaoRef ? String(question.requisicaoRef) : "-",
+                            },
+                            {
+                                label: "Referência (resposta)",
+                                value: question?.respostaTesteRef ? String(question.respostaTesteRef) : "-",
+                            },
+                            {
+                                label: "Referência (amostra)",
+                                value: question?.amostraRef ? String(question.amostraRef) : "-",
+                            },
+                            {
+                                label: "Referência (evidências)",
+                                value: question?.evidenciasRef ? String(question.evidenciasRef) : "-",
+                            },
+                        ]
                         : []),
-                    {
-                        label: "Teste (status)",
-                        value: question?.testStatus != null ? String(question.testStatus) : undefined,
-                    },
-                    { label: "Teste (descrição)", value: question?.testDescription },
-                    { label: "Referência (requisição)", value: question?.requisicaoRef },
-                    { label: "Referência (resposta do teste)", value: question?.respostaTesteRef },
-                    { label: "Referência (amostra)", value: question?.amostraRef },
-                    { label: "Referência (evidências)", value: question?.evidenciasRef },
-                    { label: "Plano de ação (origem)", value: question?.actionOrigem },
-                    { label: "Plano de ação (responsável)", value: question?.actionResponsavel },
-                    { label: "Plano de ação (descrição)", value: question?.actionDescricao },
-                    {
-                        label: "Plano de ação (data apontamento)",
-                        value: safeDate(question?.actionDataApontamento)?.toLocaleDateString("pt-BR"),
-                    },
-                    {
-                        label: "Plano de ação (prazo original)",
-                        value: safeDate(question?.actionPrazoOriginal)?.toLocaleDateString("pt-BR"),
-                    },
-                    {
-                        label: "Plano de ação (prazo atual)",
-                        value: safeDate(question?.actionPrazoAtual)?.toLocaleDateString("pt-BR"),
-                    },
-                    { label: "Plano de ação (comentários)", value: question?.actionComentarios },
-                ]
-                    .filter((lv) => lv.value != null && String(lv.value).trim() !== "")
-                    .map((lv) => ({ label: lv.label, value: String(lv.value) }));
+                ];
                 const atts = Array.isArray(question?.attachments) ? question.attachments : [];
                 let estimatedHeight = 0;
                 estimatedHeight += boxPaddingY;
-                estimatedHeight += measureTextHeight(`${index + 1}. ${ReportService.sanitizeQuestionTitle(question?.texto)}`, { width: innerW, font: "Helvetica-Bold", fontSize: 12, lineGap: 2 });
-                estimatedHeight += 10;
                 plannedLines.forEach(({ label, value }) => {
                     estimatedHeight += measureTextHeight(`${label}: ${value || "-"}`, {
                         width: innerW,
@@ -651,112 +1478,82 @@ class ReportService {
                     return acc;
                 }, new Map())
                     .values());
-                if (uniqueAttachmentsForEstimate.length > 0) {
-                    estimatedHeight += 14;
-                    estimatedHeight += measureTextHeight("Arquivos", {
-                        width: innerW,
-                        font: "Helvetica-Bold",
-                        fontSize: 10.5,
-                    });
-                    uniqueAttachmentsForEstimate.forEach((att) => {
-                        estimatedHeight += measureTextHeight(`• [${att.category}] ${att.originalName || att.filename || "Arquivo"}`, { width: innerW, font: "Helvetica", fontSize: 10, lineGap: 2 });
-                        if (att.referenceText) {
-                            estimatedHeight += measureTextHeight(`  Referência: ${att.referenceText}`, { width: innerW - 10, font: "Helvetica", fontSize: 9.5, lineGap: 2 });
-                        }
-                        estimatedHeight += 2;
+                const attachmentGroups = [
+                    {
+                        label: "Requisição",
+                        categories: ["TEST_REQUISICAO", "TESTE_REQUISICAO"],
+                    },
+                    {
+                        label: "Resposta",
+                        categories: ["TEST_RESPOSTA", "TESTE_RESPOSTA"],
+                    },
+                    {
+                        label: "Amostra",
+                        categories: ["TEST_AMOSTRA", "TESTE_AMOSTRA"],
+                    },
+                    {
+                        label: "Evidências",
+                        categories: ["TEST_EVIDENCIAS", "TESTE_EVIDENCIAS"],
+                    },
+                ];
+                if (showTestDetails) {
+                    attachmentGroups.forEach((group) => {
+                        const groupAtts = uniqueAttachmentsForEstimate.filter((att) => group.categories.includes(att.category));
+                        if (groupAtts.length === 0)
+                            return;
+                        estimatedHeight += 14;
+                        estimatedHeight += measureTextHeight(`Arquivos - ${group.label}`, {
+                            width: innerW,
+                            font: "Helvetica-Bold",
+                            fontSize: 10.5,
+                        });
+                        groupAtts.forEach((att) => {
+                            estimatedHeight += measureTextHeight(`• ${att.originalName || att.filename || "Arquivo"}`, { width: innerW, font: "Helvetica", fontSize: 10, lineGap: 2 });
+                            estimatedHeight += 2;
+                        });
                     });
                 }
                 estimatedHeight += boxPaddingY + 10;
                 ensureSpace(Math.ceil(estimatedHeight));
                 const boxY = pdf.y;
                 pdf.y = boxY + boxPaddingY;
-                pdf
-                    .fillColor(textDark)
-                    .font("Helvetica-Bold")
-                    .fontSize(12)
-                    .text(`${index + 1}. ${ReportService.sanitizeQuestionTitle(question?.texto)}`, innerX, pdf.y, { width: innerW, lineGap: 2 });
-                pdf.moveDown(0.4);
                 pdf.fillColor(textMuted).font("Helvetica").fontSize(10);
-                kv("Aplicável", question?.aplicavel ? "Sim" : "Não", innerX, innerW);
-                if (question?.capitulacao)
-                    kv("Capitulação", String(question.capitulacao), innerX, innerW);
-                if (question?.criticidade)
-                    kv("Criticidade", String(question.criticidade), innerX, innerW);
-                if (question?.resposta)
-                    kv("Resposta", String(question.resposta), innerX, innerW);
-                if (question?.respostaTexto)
-                    kv("Resposta (texto)", String(question.respostaTexto), innerX, innerW);
-                if (question?.deficienciaTexto)
-                    kv("Deficiência", String(question.deficienciaTexto), innerX, innerW);
-                if (incluirRecomendacoes === "INCLUIR" && question?.recomendacaoTexto)
-                    kv("Recomendação", String(question.recomendacaoTexto), innerX, innerW);
-                if (question?.testStatus)
-                    kv("Teste (status)", String(question.testStatus), innerX, innerW);
-                if (question?.testDescription)
-                    kv("Teste (descrição)", String(question.testDescription), innerX, innerW);
-                if (question?.requisicaoRef)
-                    kv("Referência (requisição)", String(question.requisicaoRef), innerX, innerW);
-                if (question?.respostaTesteRef)
-                    kv("Referência (resposta do teste)", String(question.respostaTesteRef), innerX, innerW);
-                if (question?.amostraRef)
-                    kv("Referência (amostra)", String(question.amostraRef), innerX, innerW);
-                if (question?.evidenciasRef)
-                    kv("Referência (evidências)", String(question.evidenciasRef), innerX, innerW);
-                if (question?.actionOrigem)
-                    kv("Plano de ação (origem)", String(question.actionOrigem), innerX, innerW);
-                if (question?.actionResponsavel)
-                    kv("Plano de ação (responsável)", String(question.actionResponsavel), innerX, innerW);
-                if (question?.actionDescricao)
-                    kv("Plano de ação (descrição)", String(question.actionDescricao), innerX, innerW);
-                const dAp = safeDate(question?.actionDataApontamento);
-                if (dAp)
-                    kv("Plano de ação (data apontamento)", dAp.toLocaleDateString("pt-BR"), innerX, innerW);
-                const dPo = safeDate(question?.actionPrazoOriginal);
-                if (dPo)
-                    kv("Plano de ação (prazo original)", dPo.toLocaleDateString("pt-BR"), innerX, innerW);
-                const dPa = safeDate(question?.actionPrazoAtual);
-                if (dPa)
-                    kv("Plano de ação (prazo atual)", dPa.toLocaleDateString("pt-BR"), innerX, innerW);
-                if (question?.actionComentarios)
-                    kv("Plano de ação (comentários)", String(question.actionComentarios), innerX, innerW);
+                if (showTestDetails) {
+                    kv("Teste (descrição)", question?.testDescription ? String(question.testDescription) : "-", innerX, innerW);
+                    kv("Referência (requisição)", question?.requisicaoRef ? String(question.requisicaoRef) : "-", innerX, innerW);
+                    kv("Referência (resposta)", question?.respostaTesteRef ? String(question.respostaTesteRef) : "-", innerX, innerW);
+                    kv("Referência (amostra)", question?.amostraRef ? String(question.amostraRef) : "-", innerX, innerW);
+                    kv("Referência (evidências)", question?.evidenciasRef ? String(question.evidenciasRef) : "-", innerX, innerW);
+                }
                 const uniqueAtts = Array.from(atts
                     .reduce((acc, att) => {
                     acc.set(`${att.category}|${att.path}`, att);
                     return acc;
                 }, new Map())
                     .values());
-                if (uniqueAtts.length > 0) {
-                    pdf.moveDown(0.4);
-                    pdf
-                        .fillColor(textDark)
-                        .font("Helvetica-Bold")
-                        .fontSize(10.5)
-                        .text("Arquivos", innerX, pdf.y);
-                    pdf.moveDown(0.2);
-                    uniqueAtts.forEach((att) => {
-                        ensureSpace(18);
-                        const link = ReportService.buildBuilderAttachmentLink(att, baseUrl);
+                if (showTestDetails) {
+                    attachmentGroups.forEach((group) => {
+                        const groupAtts = uniqueAtts.filter((att) => group.categories.includes(att.category));
+                        if (groupAtts.length === 0)
+                            return;
+                        pdf.moveDown(0.4);
                         pdf
-                            .fillColor(linkColor)
-                            .font("Helvetica")
-                            .fontSize(10)
-                            .text(`• [${att.category}] ${att.originalName || att.filename || "Arquivo"}`, innerX, pdf.y, {
-                            width: innerW,
-                            link,
-                            underline: true,
-                            lineGap: 2,
-                        });
-                        pdf.fillColor(textMuted);
-                        if (att.referenceText) {
+                            .fillColor(textDark)
+                            .font("Helvetica-Bold")
+                            .fontSize(10.5)
+                            .text(`Arquivos - ${group.label}`, innerX, pdf.y);
+                        pdf.moveDown(0.2);
+                        groupAtts.forEach((att) => {
+                            ensureSpace(18);
                             pdf
                                 .fillColor(textMuted)
                                 .font("Helvetica")
-                                .fontSize(9.5)
-                                .text(`  Referência: ${att.referenceText}`, innerX + 10, pdf.y, {
-                                width: innerW - 10,
+                                .fontSize(10)
+                                .text(`• ${att.originalName || att.filename || "Arquivo"}`, innerX, pdf.y, {
+                                width: innerW,
                                 lineGap: 2,
                             });
-                        }
+                        });
                     });
                 }
                 const boxEndY = pdf.y + boxPaddingY;
@@ -766,7 +1563,255 @@ class ReportService {
                     .stroke();
                 pdf.y = boxEndY + 10;
             });
+            h3(`${itemPrefix}.1 Apontamentos`);
+            if (sectionDeficiencias.length === 0) {
+                p("Nenhuma deficiência identificada.");
+            }
+            else {
+                sectionDeficiencias.forEach((def, defIndex) => {
+                    ensureSpace(24);
+                    pdf
+                        .fillColor(textDark)
+                        .font("Helvetica-Bold")
+                        .fontSize(11)
+                        .text(`${defIndex + 1}. Deficiência: ${def.deficiencia}`, marginLeft, pdf.y, {
+                        width: contentWidth,
+                        lineGap: 2,
+                    });
+                    pdf.moveDown(0.2);
+                    if (def.criticidade) {
+                        pdf
+                            .fillColor(textMuted)
+                            .font("Helvetica")
+                            .fontSize(10.5)
+                            .text(`Criticidade: ${def.criticidade}`, marginLeft, pdf.y, {
+                            width: contentWidth,
+                            lineGap: 2,
+                        });
+                    }
+                    if (incluirRecomendacoes === "INCLUIR" && def.recomendacao) {
+                        pdf
+                            .fillColor(textMuted)
+                            .font("Helvetica")
+                            .fontSize(10.5)
+                            .text(`Recomendação: ${def.recomendacao}`, marginLeft, pdf.y, {
+                            width: contentWidth,
+                            lineGap: 2,
+                        });
+                    }
+                });
+            }
         });
+        titleBlock("5- CONCLUSÃO");
+        p("A tabela abaixo mostra a relação de deficiências e respectiva criticidade identificadas como resultado da avaliação dos diversos itens do Programa de PLD/FTP da Instituição.");
+        const conclusaoRows = ReportService.buildConclusaoRows(sections);
+        const drawConclusaoTable = (rows) => {
+            const labelWidth = 220;
+            const colWidth = Math.floor((contentWidth - labelWidth) / 4);
+            const paddingX = 6;
+            const paddingY = 6;
+            const fillHeader = "#F1F5F2";
+            const borderColor = "#94A3B8";
+            const fillBaixa = "#DCFCE7";
+            const fillMedia = "#FEF9C3";
+            const fillAlta = "#FEE2E2";
+            const drawRow = (values, isHeader) => {
+                const rowHeight = Math.max(measureTextHeight(values[0], {
+                    width: labelWidth - paddingX * 2,
+                    font: isHeader ? "Helvetica-Bold" : "Helvetica",
+                    fontSize: 10,
+                    lineGap: 1,
+                }), measureTextHeight(values[1], {
+                    width: colWidth - paddingX * 2,
+                    font: isHeader ? "Helvetica-Bold" : "Helvetica",
+                    fontSize: 10,
+                    lineGap: 1,
+                })) + paddingY * 2;
+                ensureSpace(rowHeight + 4);
+                const startY = pdf.y;
+                const fill = isHeader ? fillHeader : "#FFFFFF";
+                pdf.save();
+                pdf.fillColor(fill).rect(marginLeft, startY, labelWidth, rowHeight).fill();
+                pdf
+                    .fillColor(fillBaixa)
+                    .rect(marginLeft + labelWidth + 0 * colWidth, startY, colWidth, rowHeight)
+                    .fill();
+                pdf
+                    .fillColor(fillMedia)
+                    .rect(marginLeft + labelWidth + 1 * colWidth, startY, colWidth, rowHeight)
+                    .fill();
+                pdf
+                    .fillColor(fillAlta)
+                    .rect(marginLeft + labelWidth + 2 * colWidth, startY, colWidth, rowHeight)
+                    .fill();
+                pdf
+                    .fillColor(fill)
+                    .rect(marginLeft + labelWidth + 3 * colWidth, startY, colWidth, rowHeight)
+                    .fill();
+                pdf.restore();
+                pdf
+                    .strokeColor(borderColor)
+                    .rect(marginLeft, startY, contentWidth, rowHeight)
+                    .stroke();
+                for (let i = 0; i < 4; i++) {
+                    pdf
+                        .strokeColor(borderColor)
+                        .moveTo(marginLeft + labelWidth + i * colWidth, startY)
+                        .lineTo(marginLeft + labelWidth + i * colWidth, startY + rowHeight)
+                        .stroke();
+                }
+                pdf
+                    .fillColor(textDark)
+                    .font(isHeader ? "Helvetica-Bold" : "Helvetica")
+                    .fontSize(10)
+                    .text(values[0], marginLeft + paddingX, startY + paddingY, {
+                    width: labelWidth - paddingX * 2,
+                    lineGap: 1,
+                });
+                values.slice(1).forEach((val, idx) => {
+                    pdf
+                        .fillColor(textDark)
+                        .font(isHeader ? "Helvetica-Bold" : "Helvetica")
+                        .fontSize(10)
+                        .text(val, marginLeft + labelWidth + idx * colWidth + paddingX, startY + paddingY, {
+                        width: colWidth - paddingX * 2,
+                        align: "center",
+                        lineGap: 1,
+                    });
+                });
+                pdf.y = startY + rowHeight;
+            };
+            drawRow(["Item avaliado", "BAIXA", "MÉDIA", "ALTA", "TOTAL"], true);
+            rows.forEach((row) => {
+                drawRow([
+                    row.label,
+                    String(row.baixa),
+                    String(row.media),
+                    String(row.alta),
+                    String(row.total),
+                ], false);
+            });
+        };
+        const drawEvidenceAnnexTable = (rows) => {
+            const labelWidth = 220;
+            const filesWidth = contentWidth - labelWidth;
+            const paddingX = 6;
+            const paddingY = 6;
+            const fillHeader = "#F1F5F9";
+            const borderColor = "#94A3B8";
+            const drawRow = (label, files, isHeader) => {
+                const filesText = isHeader
+                    ? (files[0]?.name || "")
+                    : files.length
+                        ? files.map((f) => `• ${f.name}`).join("\n")
+                        : "-";
+                const rowHeight = Math.max(measureTextHeight(label, {
+                    width: labelWidth - paddingX * 2,
+                    font: isHeader ? "Helvetica-Bold" : "Helvetica",
+                    fontSize: 10,
+                    lineGap: 1,
+                }), measureTextHeight(filesText, {
+                    width: filesWidth - paddingX * 2,
+                    font: isHeader ? "Helvetica-Bold" : "Helvetica",
+                    fontSize: 10,
+                    lineGap: 2,
+                })) + paddingY * 2;
+                ensureSpace(rowHeight + 4);
+                const startY = pdf.y;
+                pdf.save();
+                pdf
+                    .fillColor(isHeader ? fillHeader : "#FFFFFF")
+                    .rect(marginLeft, startY, labelWidth, rowHeight)
+                    .fill();
+                pdf
+                    .fillColor(isHeader ? fillHeader : "#FFFFFF")
+                    .rect(marginLeft + labelWidth, startY, filesWidth, rowHeight)
+                    .fill();
+                pdf.restore();
+                pdf
+                    .strokeColor(borderColor)
+                    .rect(marginLeft, startY, contentWidth, rowHeight)
+                    .stroke();
+                pdf
+                    .strokeColor(borderColor)
+                    .moveTo(marginLeft + labelWidth, startY)
+                    .lineTo(marginLeft + labelWidth, startY + rowHeight)
+                    .stroke();
+                pdf
+                    .fillColor(textDark)
+                    .font(isHeader ? "Helvetica-Bold" : "Helvetica")
+                    .fontSize(10)
+                    .text(label, marginLeft + paddingX, startY + paddingY, {
+                    width: labelWidth - paddingX * 2,
+                    lineGap: 1,
+                });
+                if (isHeader) {
+                    pdf
+                        .fillColor(textDark)
+                        .font("Helvetica-Bold")
+                        .fontSize(10)
+                        .text(filesText, marginLeft + labelWidth + paddingX, startY + paddingY, {
+                        width: filesWidth - paddingX * 2,
+                        lineGap: 2,
+                    });
+                }
+                else if (files.length === 0) {
+                    pdf
+                        .fillColor(textDark)
+                        .font("Helvetica")
+                        .fontSize(10)
+                        .text("-", marginLeft + labelWidth + paddingX, startY + paddingY, {
+                        width: filesWidth - paddingX * 2,
+                        lineGap: 2,
+                    });
+                }
+                else {
+                    let cursorY = startY + paddingY;
+                    files.forEach((file) => {
+                        pdf
+                            .fillColor(linkColor)
+                            .font("Helvetica")
+                            .fontSize(10)
+                            .text(`• ${file.name}`, marginLeft + labelWidth + paddingX, cursorY, {
+                            width: filesWidth - paddingX * 2,
+                            lineGap: 2,
+                            link: file.url || undefined,
+                            underline: true,
+                        });
+                        cursorY = pdf.y;
+                    });
+                }
+                pdf.y = startY + rowHeight;
+            };
+            drawRow("Item avaliado", [{ name: "Arquivos", url: "" }], true);
+            rows.forEach((row) => drawRow(row.itemLabel, row.files, false));
+        };
+        drawConclusaoTable(conclusaoRows);
+        // Resultado da Avaliação (user form PDF) - renderizado apenas se mostrarMetodologia === 'MOSTRAR'
+        if (mostrarMetodologia === "MOSTRAR") {
+            const resultadoAvaliacao = ReportService.calcularResultadoAvaliacao(sections);
+            pdf.moveDown(0.6);
+            h3("Resultado da Avaliação");
+            pdf
+                .fillColor(textDark)
+                .font("Helvetica-Bold")
+                .fontSize(10)
+                .text("Resultado: ", marginLeft, pdf.y, { continued: true })
+                .font("Helvetica")
+                .text(resultadoAvaliacao.resultado, { lineGap: 2 });
+            pdf.moveDown(0.3);
+            p(resultadoAvaliacao.descricao);
+        }
+        const evidenceRows = ReportService.buildEvidenceAnnexRows(sections, "4", baseUrl);
+        pdf.moveDown(0.8);
+        titleBlock("6- ANEXO EVIDÊNCIAS");
+        p("A tabela abaixo apresenta os itens avaliados e todos os arquivos enviados (norma e demais anexos) relacionados às questões.");
+        if (evidenceRows.length > 0) {
+            drawEvidenceAnnexTable(evidenceRows);
+        }
+        else {
+            p("-");
+        }
         pdf.end();
         await new Promise((resolve, reject) => {
             stream.on("finish", () => resolve());
@@ -824,6 +1869,16 @@ class ReportService {
             ? opts?.metadata?.instituicoes ?? []
             : [];
         const introAvaliador = (opts?.metadata?.qualificacaoAvaliador || "").trim();
+        const incluirRecomendacoes = String(opts?.metadata?.incluirRecomendacoes || "INCLUIR").toUpperCase();
+        const mostrarMetodologia = String(opts?.metadata?.mostrarMetodologia || "MOSTRAR").toUpperCase();
+        const introInstituicoesInline = introInstituicoes.length
+            ? introInstituicoes
+                .map((inst) => `${(inst.nome || "-").trim()}${inst.cnpj ? ` (CNPJ: ${inst.cnpj})` : ""}`)
+                .join(", ")
+            : "-";
+        const formCreatedAtText = ReportService.formatDatePtBr(new Date());
+        const sectionLabels = ReportService.getSectionLabels(sections);
+        const deficiencias = ReportService.collectDeficiencias(sections);
         const reportName = introName ? `Relatório PLD Builder - ${introName}` : `Relatório PLD Builder - ${user.name}`;
         if (format === "DOCX") {
             const filename = `pld-builder-report-${userId}-${timestamp}.docx`;
@@ -845,118 +1900,113 @@ class ReportService {
                         new docx_1.TextRun({ text: `Data: ${generatedAt}`, break: 1 }),
                     ],
                 }),
-                new docx_1.Paragraph({ text: "Introdução", heading: docx_1.HeadingLevel.HEADING_1 }),
-                ...(introInstituicoes.length
-                    ? [
-                        new docx_1.Paragraph({
-                            spacing: { after: 120 },
-                            children: [new docx_1.TextRun({ text: "Instituição(ões)", bold: true })],
-                        }),
-                        ...introInstituicoes.map((inst) => new docx_1.Paragraph({
-                            bullet: { level: 0 },
-                            children: [
-                                new docx_1.TextRun({
-                                    text: `${(inst.nome || "-").trim()}${inst.cnpj ? ` (CNPJ: ${inst.cnpj})` : ""}`,
-                                }),
-                            ],
-                        })),
-                    ]
-                    : [
-                        new docx_1.Paragraph({
-                            spacing: { after: 120 },
-                            children: [new docx_1.TextRun({ text: "Instituição(ões): -", bold: true })],
-                        }),
-                    ]),
+                ReportService.buildDocxFullWidthTitle("1- Introdução"),
                 new docx_1.Paragraph({
-                    spacing: { before: 120, after: 120 },
-                    children: [new docx_1.TextRun({ text: "Descrição do avaliador", bold: true })],
+                    text: "Conforme artigo 62 da Circular BCB nº 3.978, de 23 de janeiro de 2020, as instituições autorizadas a funcionar pelo Banco Central do Brasil devem avaliar anualmente a efetividade da política, dos procedimentos e dos controles internos por elas implementados para a prevenção à lavagem de dinheiro e ao financiamento do terrorismo.",
+                    spacing: { after: 160 },
                 }),
+                new docx_1.Paragraph({
+                    text: `Este relatório contém o resultado da avaliação dos diversos itens do programa de PLD/FTP das instituições ${introInstituicoesInline}.`,
+                    spacing: { after: 160 },
+                }),
+                new docx_1.Paragraph({
+                    text: "Para fins de elaboração deste relatório, Instituição será doravante adotado para designar ambas as instituições.",
+                    spacing: { after: 160 },
+                }),
+                new docx_1.Paragraph({
+                    text: "Em atendimento ao disposto no § 1º do artigo 62 da Circular BCB nº 3.978/20, este relatório descreve a metodologia empregada nessa avaliação, os testes aplicados, a qualificação do avaliador, os itens avaliados e o resultado dessa avaliação (deficiências identificadas).",
+                    spacing: { after: 160 },
+                }),
+                new docx_1.Paragraph({
+                    text: `A avaliação considerou o programa de PLD/FTP vigente em ${formCreatedAtText}.`,
+                    spacing: { after: 160 },
+                }),
+                ReportService.buildDocxFullWidthTitle("2- Metodologia de Avaliação"),
+                new docx_1.Paragraph({
+                    text: "A metodologia de avaliação consistiu na:",
+                    spacing: { after: 120 },
+                }),
+                ...[
+                    "verificação da existência, formalização, conteúdo, atualização e, quando for o caso, a divulgação dos documentos exigidos expressamente na Circular BCB nº 3.978/20:",
+                ].map((item) => new docx_1.Paragraph({
+                    bullet: { level: 0 },
+                    text: item,
+                })),
+                ...[
+                    "Política de PLD/FTP;",
+                    "Manual de Procedimentos Conheça seu Cliente;",
+                    "Manual de Procedimentos de Monitoramento, Seleção, Análise e Comunicação de Operações Suspeitas (Procedimentos MSAC);",
+                    "Procedimentos Conheça seu Funcionário;",
+                    "Procedimentos Conheça seu Parceiro;",
+                    "Procedimentos Conheça seu Prestador de Serviço Terceirizado;",
+                    "Relatório de Avaliação Interna de Risco",
+                    "Relatório de Avaliação de Efetividade do ano anterior;",
+                    "Plano de Ação para correção das deficiências identificadas no Relatório de Avaliação de Efetividade do ano anterior;",
+                    "Relatório de Acompanhamento do Plano de Ação;",
+                ].map((item) => new docx_1.Paragraph({
+                    bullet: { level: 1 },
+                    text: item,
+                })),
+                ...[
+                    "avaliação da estrutura e dos procedimentos de governança de PLD/FTP;",
+                    "avaliação do programa de treinamento em PLD/FTP e das ações de promoção da cultura organizacional de PLD/FTP;",
+                    "avaliação dos procedimentos MSAC, incluindo a adequação da área de PLD/FTP;",
+                    "avaliação dos procedimentos relacionados ao cumprimento das disposições da Lei nº 13.810/19, regulamentados pela Resolução BCB nº 44/20 e Instrução Normativa BCB nº 262/22;",
+                    "avaliação dos procedimentos antifraude;",
+                    "avaliação dos mecanismos de acompanhamento e de controle de que trata o Capítulo X da Circular BCB nº 3.978/20, incluindo auditoria interna;",
+                    "realização de testes com o propósito de verificar a aderência dos procedimentos vigentes em relação ao disposto nos documentos internos, por meio de: entrevistas; requisição de evidências; amostragem; acompanhamento, por meio de reuniões remotas, da execução dos procedimentos e controles de PLD/FTP pelos responsáveis diretos por tal execução; e na análise de relatórios gerenciais e de estatísticas relativas ao sistema de monitoramento e aos procedimentos conheça seu cliente.",
+                ].map((item) => new docx_1.Paragraph({
+                    bullet: { level: 0 },
+                    text: item,
+                })),
+                new docx_1.Paragraph({
+                    text: "Os itens avaliados do programa de PLD/FTP da Instituição foram:",
+                    spacing: { before: 120, after: 80 },
+                }),
+                ...(sectionLabels.length > 0
+                    ? sectionLabels.map((label, idx) => new docx_1.Paragraph({
+                        bullet: { level: 0 },
+                        text: `${idx + 1}. ${label}`,
+                    }))
+                    : [new docx_1.Paragraph({ text: "-" })]),
+                new docx_1.Paragraph({
+                    text: "A descrição detalhada da avaliação de cada item, incluindo os testes realizados, consta no item EXECUÇÃO.",
+                    spacing: { before: 160, after: 120 },
+                }),
+                new docx_1.Paragraph({
+                    text: "Como resultado dessa avaliação, a deficiência identificada recebeu um grau de criticidade definido conforme tabela abaixo.",
+                    spacing: { after: 120 },
+                }),
+                ReportService.buildCriticidadeTableDocx(),
+                new docx_1.Paragraph({
+                    text: "O resultado da avaliação de efetividade resultará na atribuição de um dos conceitos, mostrados a seguir, ao programa de PLD/FTP da Instituição.",
+                    spacing: { before: 200, after: 160 },
+                }),
+                ReportService.buildEfetividadeTableDocx(),
+                new docx_1.Paragraph({ text: "", spacing: { after: 400 } }),
+                ReportService.buildDocxFullWidthTitle("3- Qualificação do Avaliador"),
                 new docx_1.Paragraph({ text: introAvaliador || "-", spacing: { after: 160 } }),
+                ReportService.buildDocxFullWidthTitle("4- Execução"),
             ];
-            sections.forEach((section) => {
+            sections.forEach((section, sectionIndex) => {
                 const sectionLabel = section.customLabel?.trim()
                     ? `${section.item} - ${section.customLabel}`
                     : section.item;
-                children.push(new docx_1.Paragraph({ text: sectionLabel, heading: docx_1.HeadingLevel.HEADING_1 }));
-                if (section.descricao) {
-                    children.push(new docx_1.Paragraph({ text: section.descricao, spacing: { after: 160 } }));
-                }
-                const normaFiles = (section.attachments || []).filter((a) => a.category === "NORMA");
-                const uniqueNormaFiles = Array.from(normaFiles
-                    .reduce((acc, att) => {
-                    acc.set(`${att.category}|${att.path}`, att);
-                    return acc;
-                }, new Map())
-                    .values());
-                if (uniqueNormaFiles.length > 0) {
-                    const normaCard = [
-                        new docx_1.Paragraph({
-                            children: [
-                                new docx_1.TextRun({ text: "Norma interna (arquivos)", bold: true }),
-                            ],
-                            spacing: { after: 120 },
-                        }),
-                    ];
-                    uniqueNormaFiles.forEach((att) => {
-                        const link = ReportService.buildBuilderAttachmentLink(att, baseUrl);
-                        normaCard.push(new docx_1.Paragraph({
-                            bullet: { level: 0 },
-                            children: [
-                                new docx_1.ExternalHyperlink({
-                                    link,
-                                    children: [
-                                        new docx_1.TextRun({
-                                            text: att.originalName,
-                                            style: "Hyperlink",
-                                            color: "0563C1",
-                                            underline: {},
-                                        }),
-                                    ],
-                                }),
-                            ],
-                        }));
-                    });
-                    children.push(ReportService.buildDocxCard(normaCard));
-                    children.push(new docx_1.Paragraph({ text: "", spacing: { after: 160 } }));
-                }
+                const itemPrefix = `4.${sectionIndex + 1}`;
+                children.push(ReportService.buildExecutionItemTitleDocx(`${itemPrefix} ${sectionLabel || "-"}`));
+                children.push(ReportService.buildLabelValueParagraph("Descrição do item avaliado", section.descricao ? String(section.descricao) : "-", { spacingAfter: 160 }));
+                const sectionDeficiencias = deficiencias.filter((def) => def.sectionLabel === (sectionLabel || "-"));
                 (section.questions || []).forEach((question, index) => {
+                    const qRef = question;
+                    const showTestDetails = String(qRef?.testStatus || "").toUpperCase() === "SIM";
                     const card = [
-                        ReportService.buildDocxCardTitle(`${index + 1}. ${ReportService.sanitizeQuestionTitle(question.texto)}`),
-                        ReportService.buildLabelValueParagraph("Aplicável", question.aplicavel ? "Sim" : "Não"),
+                        ...(showTestDetails
+                            ? [
+                                ReportService.buildLabelValueParagraph("Teste (descrição)", qRef.testDescription ? String(qRef.testDescription) : "-"),
+                                ReportService.buildLabelValueParagraph("Resposta do Teste", qRef.respostaTesteRef ? String(qRef.respostaTesteRef) : "-"),
+                            ]
+                            : []),
                     ];
-                    if (question.capitulacao)
-                        card.push(ReportService.buildLabelValueParagraph("Capitulação", question.capitulacao));
-                    if (question.criticidade)
-                        card.push(ReportService.buildLabelValueParagraph("Criticidade", String(question.criticidade)));
-                    if (question.resposta)
-                        card.push(ReportService.buildLabelValueParagraph("Resposta", question.resposta));
-                    if (question.respostaTexto)
-                        card.push(ReportService.buildLabelValueParagraph("Resposta (texto)", question.respostaTexto));
-                    if (question.deficienciaTexto)
-                        card.push(ReportService.buildLabelValueParagraph("Deficiência", question.deficienciaTexto));
-                    if (question.recomendacaoTexto)
-                        card.push(ReportService.buildLabelValueParagraph("Recomendação", question.recomendacaoTexto));
-                    if (question.testStatus)
-                        card.push(ReportService.buildLabelValueParagraph("Teste (status)", String(question.testStatus)));
-                    if (question.testDescription)
-                        card.push(ReportService.buildLabelValueParagraph("Teste (descrição)", question.testDescription));
-                    if (question.actionOrigem)
-                        card.push(ReportService.buildLabelValueParagraph("Ação (origem)", question.actionOrigem));
-                    if (question.actionResponsavel)
-                        card.push(ReportService.buildLabelValueParagraph("Ação (responsável)", question.actionResponsavel));
-                    if (question.actionDescricao)
-                        card.push(ReportService.buildLabelValueParagraph("Ação (descrição)", question.actionDescricao));
-                    if (question.actionDataApontamento) {
-                        card.push(ReportService.buildLabelValueParagraph("Ação (data apontamento)", new Date(question.actionDataApontamento).toLocaleDateString("pt-BR")));
-                    }
-                    if (question.actionPrazoOriginal) {
-                        card.push(ReportService.buildLabelValueParagraph("Ação (prazo original)", new Date(question.actionPrazoOriginal).toLocaleDateString("pt-BR")));
-                    }
-                    if (question.actionPrazoAtual) {
-                        card.push(ReportService.buildLabelValueParagraph("Ação (prazo atual)", new Date(question.actionPrazoAtual).toLocaleDateString("pt-BR")));
-                    }
-                    if (question.actionComentarios)
-                        card.push(ReportService.buildLabelValueParagraph("Ação (comentários)", question.actionComentarios));
                     const atts = question.attachments || [];
                     const uniqueAtts = Array.from(atts
                         .reduce((acc, att) => {
@@ -964,43 +2014,122 @@ class ReportService {
                         return acc;
                     }, new Map())
                         .values());
-                    if (uniqueAtts.length > 0) {
-                        card.push(ReportService.buildDocxCardSectionTitle("Arquivos"));
-                        uniqueAtts.forEach((att) => {
-                            const link = ReportService.buildBuilderAttachmentLink(att, baseUrl);
-                            card.push(new docx_1.Paragraph({
-                                bullet: { level: 0 },
-                                children: [
-                                    new docx_1.TextRun({ text: `[${att.category}] ` }),
-                                    new docx_1.ExternalHyperlink({
-                                        link,
-                                        children: [
-                                            new docx_1.TextRun({
-                                                text: att.originalName,
-                                                style: "Hyperlink",
-                                                color: "0563C1",
-                                                underline: {},
-                                            }),
-                                        ],
-                                    }),
-                                ],
-                            }));
-                            if (att.referenceText) {
+                    // Todos os grupos de arquivos
+                    const attachmentGroups = [
+                        {
+                            label: "Requisição",
+                            categories: ["TEST_REQUISICAO", "TESTE_REQUISICAO"],
+                        },
+                        {
+                            label: "Resposta",
+                            categories: ["TEST_RESPOSTA", "TESTE_RESPOSTA"],
+                        },
+                        {
+                            label: "Amostra",
+                            categories: ["TEST_AMOSTRA", "TESTE_AMOSTRA"],
+                        },
+                        {
+                            label: "Evidências",
+                            categories: ["TEST_EVIDENCIAS", "TESTE_EVIDENCIAS"],
+                        },
+                    ];
+                    if (showTestDetails) {
+                        attachmentGroups.forEach((group) => {
+                            const groupAtts = uniqueAtts.filter((att) => group.categories.includes(att.category));
+                            if (groupAtts.length === 0)
+                                return;
+                            card.push(ReportService.buildDocxCardSectionTitle(`Arquivos - ${group.label}`));
+                            groupAtts.forEach((att) => {
                                 card.push(new docx_1.Paragraph({
-                                    indent: { left: 360 },
-                                    children: [
-                                        new docx_1.TextRun({ text: `Referência: ${att.referenceText}` }),
-                                    ],
+                                    bullet: { level: 0 },
+                                    children: [new docx_1.TextRun({ text: att.originalName })],
                                 }));
-                            }
+                            });
                         });
                     }
                     children.push(ReportService.buildDocxCard(card));
                     children.push(new docx_1.Paragraph({ text: "", spacing: { after: 160 } }));
                 });
+                children.push(new docx_1.Paragraph({
+                    text: `${itemPrefix}.1 Apontamentos`,
+                    heading: docx_1.HeadingLevel.HEADING_3,
+                }));
+                if (sectionDeficiencias.length === 0) {
+                    children.push(new docx_1.Paragraph({
+                        text: "Nenhuma deficiência identificada.",
+                        spacing: { after: 160 },
+                    }));
+                }
+                else {
+                    sectionDeficiencias.forEach((def, defIndex) => {
+                        children.push(new docx_1.Paragraph({
+                            spacing: { after: 80 },
+                            children: [
+                                new docx_1.TextRun({
+                                    text: `${defIndex + 1}. Deficiência: ${def.deficiencia}`,
+                                    bold: true,
+                                }),
+                            ],
+                        }));
+                        if (def.criticidade) {
+                            children.push(new docx_1.Paragraph({
+                                children: [new docx_1.TextRun({ text: `Criticidade: ${def.criticidade}` })],
+                            }));
+                        }
+                        if (incluirRecomendacoes === "INCLUIR" && def.recomendacao) {
+                            children.push(new docx_1.Paragraph({
+                                children: [new docx_1.TextRun({ text: `Recomendação: ${def.recomendacao}` })],
+                            }));
+                        }
+                        children.push(new docx_1.Paragraph({ text: "", spacing: { after: 120 } }));
+                    });
+                }
                 children.push(new docx_1.Paragraph({ text: "", spacing: { after: 200 } }));
             });
+            const conclusaoRows = ReportService.buildConclusaoRows(sections);
+            children.push(ReportService.buildDocxFullWidthTitle("5- CONCLUSÃO"));
+            children.push(new docx_1.Paragraph({
+                text: "A tabela abaixo mostra a relação de deficiências e respectiva criticidade identificadas como resultado da avaliação dos diversos itens do Programa de PLD/FTP da Instituição.",
+                spacing: { after: 120 },
+            }));
+            children.push(ReportService.buildConclusaoTableDocx(conclusaoRows));
+            // Resultado da Avaliação (admin builder DOCX) - renderizado apenas se mostrarMetodologia === 'MOSTRAR'
+            if (mostrarMetodologia === "MOSTRAR") {
+                const resultadoAvaliacao = ReportService.calcularResultadoAvaliacao(sections);
+                children.push(new docx_1.Paragraph({
+                    text: "Resultado da Avaliação",
+                    heading: docx_1.HeadingLevel.HEADING_2,
+                    spacing: { before: 240, after: 120 },
+                }));
+                children.push(new docx_1.Paragraph({
+                    children: [
+                        new docx_1.TextRun({ text: "Resultado: ", bold: true }),
+                        new docx_1.TextRun({ text: resultadoAvaliacao.resultado }),
+                    ],
+                    spacing: { after: 80 },
+                }));
+                children.push(new docx_1.Paragraph({
+                    text: resultadoAvaliacao.descricao,
+                    spacing: { after: 200 },
+                }));
+            }
+            else {
+                children.push(new docx_1.Paragraph({ text: "", spacing: { after: 200 } }));
+            }
+            const evidenceRows = ReportService.buildEvidenceAnnexRows(sections, "4", baseUrl);
+            children.push(ReportService.buildDocxFullWidthTitle("6- ANEXO EVIDÊNCIAS"));
+            children.push(new docx_1.Paragraph({
+                text: "A tabela abaixo apresenta os itens avaliados e todos os arquivos enviados (norma e demais anexos) relacionados às questões.",
+                spacing: { after: 120 },
+            }));
+            if (evidenceRows.length > 0) {
+                children.push(ReportService.buildEvidenceAnnexTableDocx(evidenceRows));
+            }
+            else {
+                children.push(new docx_1.Paragraph({ text: "-", spacing: { after: 120 } }));
+            }
             const doc = new docx_1.Document({
+                styles: ReportService.buildDocxStyles(),
                 sections: [
                     {
                         properties: {},
@@ -1076,6 +2205,15 @@ class ReportService {
                 .text(text, marginLeft, pdf.y, { width: contentWidth });
             pdf.moveDown(0.4);
         };
+        const h2Item = (text) => {
+            ensureSpace(28);
+            pdf
+                .fillColor(textDark)
+                .font("Helvetica-Bold")
+                .fontSize(13)
+                .text(text, marginLeft, pdf.y, { width: contentWidth });
+            pdf.moveDown(0.35);
+        };
         const h3 = (text) => {
             ensureSpace(24);
             pdf
@@ -1114,6 +2252,112 @@ class ReportService {
                 .fontSize(fontSize)
                 .heightOfString(text || "-", { width, lineGap });
         };
+        const titleBlock = (text, align = "left") => {
+            ensureSpace(28);
+            const paddingX = 8;
+            const paddingY = 6;
+            const textHeight = measureTextHeight(text, {
+                width: contentWidth - paddingX * 2,
+                font: "Helvetica-Bold",
+                fontSize: 11,
+                lineGap: 2,
+            });
+            const boxHeight = textHeight + paddingY * 2;
+            const startY = pdf.y;
+            pdf.save();
+            pdf.fillColor("#E2E8F0").rect(marginLeft, startY, contentWidth, boxHeight).fill();
+            pdf
+                .fillColor(textDark)
+                .font("Helvetica-Bold")
+                .fontSize(11)
+                .text(text, marginLeft + paddingX, startY + paddingY, {
+                width: contentWidth - paddingX * 2,
+                align,
+            });
+            pdf.restore();
+            pdf.y = startY + boxHeight + 6;
+        };
+        const bulletItem = (text) => {
+            ensureSpace(18);
+            pdf
+                .fillColor(textMuted)
+                .font("Helvetica")
+                .fontSize(10.5)
+                .text(`• ${text}`, marginLeft + 10, pdf.y, {
+                width: contentWidth - 10,
+                lineGap: 2,
+            });
+            pdf.moveDown(0.2);
+        };
+        const bulletItemSecondary = (text) => {
+            ensureSpace(18);
+            pdf
+                .fillColor(textMuted)
+                .font("Helvetica")
+                .fontSize(10.5)
+                .text(`- ${text}`, marginLeft + 24, pdf.y, {
+                width: contentWidth - 24,
+                lineGap: 2,
+            });
+            pdf.moveDown(0.2);
+        };
+        const drawCriteriaTable = (rows) => {
+            const labelWidth = 120;
+            const descWidth = contentWidth - labelWidth;
+            const paddingX = 6;
+            const paddingY = 6;
+            rows.forEach((row) => {
+                const labelHeight = measureTextHeight(row.label, {
+                    width: labelWidth - paddingX * 2,
+                    font: "Helvetica-Bold",
+                    fontSize: 10,
+                    lineGap: 1,
+                });
+                const descHeight = measureTextHeight(row.description, {
+                    width: descWidth - paddingX * 2,
+                    font: "Helvetica",
+                    fontSize: 10,
+                    lineGap: 2,
+                });
+                const rowHeight = Math.max(labelHeight, descHeight) + paddingY * 2;
+                ensureSpace(rowHeight + 6);
+                const startY = pdf.y;
+                pdf.save();
+                pdf.fillColor(row.labelFill).rect(marginLeft, startY, labelWidth, rowHeight).fill();
+                pdf
+                    .fillColor("#FFFFFF")
+                    .rect(marginLeft + labelWidth, startY, descWidth, rowHeight)
+                    .fill();
+                pdf.restore();
+                pdf
+                    .strokeColor(lineColor)
+                    .rect(marginLeft, startY, contentWidth, rowHeight)
+                    .stroke();
+                pdf
+                    .strokeColor(lineColor)
+                    .moveTo(marginLeft + labelWidth, startY)
+                    .lineTo(marginLeft + labelWidth, startY + rowHeight)
+                    .stroke();
+                pdf
+                    .fillColor(textDark)
+                    .font("Helvetica-Bold")
+                    .fontSize(10)
+                    .text(row.label, marginLeft + paddingX, startY + paddingY, {
+                    width: labelWidth - paddingX * 2,
+                    lineGap: 1,
+                });
+                pdf
+                    .fillColor(textMuted)
+                    .font("Helvetica")
+                    .fontSize(10)
+                    .text(row.description, marginLeft + labelWidth + paddingX, startY + paddingY, {
+                    width: descWidth - paddingX * 2,
+                    lineGap: 2,
+                });
+                pdf.y = startY + rowHeight;
+            });
+            pdf.moveDown(0.6);
+        };
         h1(title);
         pdf
             .fillColor(textMuted)
@@ -1123,22 +2367,92 @@ class ReportService {
         pdf.text(`Data: ${generatedAt}`, { align: "center" });
         pdf.moveDown(1.0);
         hr();
-        // Introdução
-        h2("Introdução");
-        if (introInstituicoes.length > 0) {
-            h3("Instituição(ões)");
-            introInstituicoes.forEach((inst, idx) => {
-                const nome = (inst.nome || "-").trim() || "-";
-                const cnpj = (inst.cnpj || "").trim();
-                p(`${idx + 1}. ${nome}${cnpj ? ` (CNPJ: ${cnpj})` : ""}`);
+        titleBlock("1- Introdução");
+        p("Conforme artigo 62 da Circular BCB nº 3.978, de 23 de janeiro de 2020, as instituições autorizadas a funcionar pelo Banco Central do Brasil devem avaliar anualmente a efetividade da política, dos procedimentos e dos controles internos por elas implementados para a prevenção à lavagem de dinheiro e ao financiamento do terrorismo.");
+        p(`Este relatório contém o resultado da avaliação dos diversos itens do programa de PLD/FTP das instituições ${introInstituicoesInline}.`);
+        p("Para fins de elaboração deste relatório, Instituição será doravante adotado para designar ambas as instituições.");
+        p("Em atendimento ao disposto no § 1º do artigo 62 da Circular BCB nº 3.978/20, este relatório descreve a metodologia empregada nessa avaliação, os testes aplicados, a qualificação do avaliador, os itens avaliados e o resultado dessa avaliação (deficiências identificadas).");
+        p(`A avaliação considerou o programa de PLD/FTP vigente em ${formCreatedAtText}.`);
+        hr();
+        titleBlock("2- Metodologia de Avaliação");
+        p("A metodologia de avaliação consistiu na:");
+        [
+            "verificação da existência, formalização, conteúdo, atualização e, quando for o caso, a divulgação dos documentos exigidos expressamente na Circular BCB nº 3.978/20:",
+        ].forEach(bulletItem);
+        [
+            "Política de PLD/FTP;",
+            "Manual de Procedimentos Conheça seu Cliente;",
+            "Manual de Procedimentos de Monitoramento, Seleção, Análise e Comunicação de Operações Suspeitas (Procedimentos MSAC);",
+            "Procedimentos Conheça seu Funcionário;",
+            "Procedimentos Conheça seu Parceiro;",
+            "Procedimentos Conheça seu Prestador de Serviço Terceirizado;",
+            "Relatório de Avaliação Interna de Risco",
+            "Relatório de Avaliação de Efetividade do ano anterior;",
+            "Plano de Ação para correção das deficiências identificadas no Relatório de Avaliação de Efetividade do ano anterior;",
+            "Relatório de Acompanhamento do Plano de Ação;",
+        ].forEach(bulletItemSecondary);
+        [
+            "avaliação da estrutura e dos procedimentos de governança de PLD/FTP;",
+            "avaliação do programa de treinamento em PLD/FTP e das ações de promoção da cultura organizacional de PLD/FTP;",
+            "avaliação dos procedimentos MSAC, incluindo a adequação da área de PLD/FTP;",
+            "avaliação dos procedimentos relacionados ao cumprimento das disposições da Lei nº 13.810/19, regulamentados pela Resolução BCB nº 44/20 e Instrução Normativa BCB nº 262/22;",
+            "avaliação dos procedimentos antifraude;",
+            "avaliação dos mecanismos de acompanhamento e de controle de que trata o Capítulo X da Circular BCB nº 3.978/20, incluindo auditoria interna;",
+            "realização de testes com o propósito de verificar a aderência dos procedimentos vigentes em relação ao disposto nos documentos internos, por meio de: entrevistas; requisição de evidências; amostragem; acompanhamento, por meio de reuniões remotas, da execução dos procedimentos e controles de PLD/FTP pelos responsáveis diretos por tal execução; e na análise de relatórios gerenciais e de estatísticas relativas ao sistema de monitoramento e aos procedimentos conheça seu cliente.",
+        ].forEach(bulletItem);
+        p("Os itens avaliados do programa de PLD/FTP da Instituição foram:");
+        if (sectionLabels.length > 0) {
+            sectionLabels.forEach((label, idx) => {
+                bulletItem(`${idx + 1}. ${label}`);
             });
         }
         else {
-            p("Instituição(ões): -");
+            p("-");
         }
-        h3("Descrição do avaliador");
+        p("A descrição detalhada da avaliação de cada item, incluindo os testes realizados, consta no item EXECUÇÃO.");
+        p("Como resultado dessa avaliação, a deficiência identificada recebeu um grau de criticidade definido conforme tabela abaixo.");
+        titleBlock("GRAU DE CRITICIDADE", "center");
+        drawCriteriaTable([
+            {
+                label: "ALTA",
+                description: "Quando a deficiência comprometer de maneira significativa a efetividade do controle de PLD/FTP associado.",
+                labelFill: "#FEE2E2",
+            },
+            {
+                label: "MÉDIA",
+                description: "Quando a deficiência corresponder a inobservância de boa prática de PLD/FTP ou quando a deficiência comprometer parcialmente a efetividade do controle de PLD/FTP associado.",
+                labelFill: "#FEF9C3",
+            },
+            {
+                label: "BAIXA",
+                description: "Quando a deficiência não compromete a efetividade do controle de PLD/FTP associado.",
+                labelFill: "#DCFCE7",
+            },
+        ]);
+        p("O resultado da avaliação de efetividade resultará na atribuição de um dos conceitos, mostrados a seguir, ao programa de PLD/FTP da Instituição.");
+        titleBlock("CRITÉRIOS DE AVALIAÇÃO DE EFETIVIDADE", "center");
+        drawCriteriaTable([
+            {
+                label: "EFETIVO",
+                description: "Quando o programa de PLD/FTP atingir a maioria dos resultados esperados, sem a identificação de deficiências de alta criticidade nos procedimentos de monitoramento, seleção, análise e comunicação de operações atípicas, nos procedimentos de verificação de sanções CSNU, e nos procedimentos conheça seu cliente.",
+                labelFill: "#DCFCE7",
+            },
+            {
+                label: "PARCIALMENTE EFETIVO",
+                description: "Quando o programa de PLD/FTP atingir a maioria dos resultados esperados, com a identificação de algumas deficiências de alta criticidade nos procedimentos conheça seu cliente ou nos procedimentos de monitoramento, seleção, análise e comunicação de operações atípicas.",
+                labelFill: "#FEF9C3",
+            },
+            {
+                label: "POUCO EFETIVO",
+                description: "Quando o programa de PLD/FTP não atingir a maioria dos resultados esperados, com a identificação de deficiências de alta criticidade nos procedimentos de monitoramento, seleção, análise e comunicação de operações atípicas, nos procedimentos de verificação de sanções CSNU, e nos procedimentos conheça seu cliente.",
+                labelFill: "#FEE2E2",
+            },
+        ]);
+        hr();
+        titleBlock("3- Qualificação do Avaliador");
         p(introAvaliador || "-");
         hr();
+        titleBlock("4- Execução");
         sections.forEach((section, sectionIndex) => {
             if (sectionIndex > 0) {
                 pdf.addPage();
@@ -1146,36 +2460,11 @@ class ReportService {
             const sectionLabel = section.customLabel?.trim()
                 ? `${section.item} - ${section.customLabel}`
                 : section.item;
-            h2(sectionLabel);
-            if (section.descricao) {
-                p(section.descricao);
-            }
-            const normaFiles = (section.attachments || []).filter((a) => a.category === "NORMA");
-            const uniqueNormaFiles = Array.from(normaFiles
-                .reduce((acc, att) => {
-                acc.set(`${att.category}|${att.path}`, att);
-                return acc;
-            }, new Map())
-                .values());
-            if (uniqueNormaFiles.length > 0) {
-                h3("Norma interna (arquivos)");
-                uniqueNormaFiles.forEach((att, idx) => {
-                    ensureSpace(18);
-                    const link = ReportService.buildBuilderAttachmentLink(att, baseUrl);
-                    pdf
-                        .fillColor(linkColor)
-                        .font("Helvetica")
-                        .fontSize(10.5)
-                        .text(`${idx + 1}. ${att.originalName}`, marginLeft, pdf.y, {
-                        width: contentWidth,
-                        link,
-                        underline: true,
-                        lineGap: 2,
-                    });
-                    pdf.fillColor(textMuted);
-                });
-                pdf.moveDown(0.6);
-            }
+            const itemPrefix = `4.${sectionIndex + 1}`;
+            h2Item(`${itemPrefix} ${sectionLabel}`);
+            kv("Descrição do item avaliado", section.descricao ? String(section.descricao) : "-");
+            pdf.moveDown(0.4);
+            const sectionDeficiencias = deficiencias.filter((def) => def.sectionLabel === (sectionLabel || "-"));
             hr();
             (section.questions || []).forEach((question, index) => {
                 const boxX = marginLeft;
@@ -1184,71 +2473,38 @@ class ReportService {
                 const boxPaddingY = 14;
                 const innerX = boxX + boxPaddingX;
                 const innerW = boxW - boxPaddingX * 2;
+                const qRef = question;
+                const showTestDetails = String(qRef?.testStatus || "").toUpperCase() === "SIM";
                 // Estimate height to avoid breaking the card across pages.
                 const plannedLines = [
-                    { label: "Aplicável", value: question.aplicavel ? "Sim" : "Não" },
-                    { label: "Capitulação", value: question.capitulacao },
-                    {
-                        label: "Criticidade",
-                        value: question.criticidade != null
-                            ? String(question.criticidade)
-                            : undefined,
-                    },
-                    { label: "Resposta", value: question.resposta },
-                    { label: "Resposta (texto)", value: question.respostaTexto },
-                    { label: "Deficiência", value: question.deficienciaTexto },
-                    { label: "Recomendação", value: question.recomendacaoTexto },
-                    {
-                        label: "Teste (status)",
-                        value: question.testStatus != null
-                            ? String(question.testStatus)
-                            : undefined,
-                    },
-                    { label: "Teste (descrição)", value: question.testDescription },
-                    { label: "Plano de ação (origem)", value: question.actionOrigem },
-                    {
-                        label: "Plano de ação (responsável)",
-                        value: question.actionResponsavel,
-                    },
-                    {
-                        label: "Plano de ação (descrição)",
-                        value: question.actionDescricao,
-                    },
-                    {
-                        label: "Plano de ação (data apontamento)",
-                        value: question.actionDataApontamento
-                            ? new Date(question.actionDataApontamento).toLocaleDateString("pt-BR")
-                            : undefined,
-                    },
-                    {
-                        label: "Plano de ação (prazo original)",
-                        value: question.actionPrazoOriginal
-                            ? new Date(question.actionPrazoOriginal).toLocaleDateString("pt-BR")
-                            : undefined,
-                    },
-                    {
-                        label: "Plano de ação (prazo atual)",
-                        value: question.actionPrazoAtual
-                            ? new Date(question.actionPrazoAtual).toLocaleDateString("pt-BR")
-                            : undefined,
-                    },
-                    {
-                        label: "Plano de ação (comentários)",
-                        value: question.actionComentarios,
-                    },
-                ]
-                    .filter((lv) => lv.value != null && String(lv.value).trim() !== "")
-                    .map((lv) => ({ label: lv.label, value: String(lv.value) }));
+                    ...(showTestDetails
+                        ? [
+                            {
+                                label: "Teste (descrição)",
+                                value: qRef.testDescription ? String(qRef.testDescription) : "-",
+                            },
+                            {
+                                label: "Referência (requisição)",
+                                value: qRef.requisicaoRef ? String(qRef.requisicaoRef) : "-",
+                            },
+                            {
+                                label: "Referência (resposta)",
+                                value: qRef.respostaTesteRef ? String(qRef.respostaTesteRef) : "-",
+                            },
+                            {
+                                label: "Referência (amostra)",
+                                value: qRef.amostraRef ? String(qRef.amostraRef) : "-",
+                            },
+                            {
+                                label: "Referência (evidências)",
+                                value: qRef.evidenciasRef ? String(qRef.evidenciasRef) : "-",
+                            },
+                        ]
+                        : []),
+                ];
                 const atts = question.attachments || [];
                 let estimatedHeight = 0;
                 estimatedHeight += boxPaddingY; // top padding
-                estimatedHeight += measureTextHeight(`${index + 1}. ${ReportService.sanitizeQuestionTitle(question.texto)}`, {
-                    width: innerW,
-                    font: "Helvetica-Bold",
-                    fontSize: 12,
-                    lineGap: 2,
-                });
-                estimatedHeight += 10; // spacing after title
                 plannedLines.forEach(({ label, value }) => {
                     estimatedHeight += measureTextHeight(`${label}: ${value || "-"}`, {
                         width: innerW,
@@ -1265,120 +2521,89 @@ class ReportService {
                     return acc;
                 }, new Map())
                     .values());
-                if (uniqueAttachmentsForEstimate.length > 0) {
-                    estimatedHeight += 14; // spacing + header
-                    estimatedHeight += measureTextHeight("Arquivos", {
-                        width: innerW,
-                        font: "Helvetica-Bold",
-                        fontSize: 10.5,
-                    });
-                    uniqueAttachmentsForEstimate.forEach((att) => {
-                        estimatedHeight += measureTextHeight(`• [${att.category}] ${att.originalName}`, {
+                const attachmentGroups = [
+                    {
+                        label: "Requisição",
+                        categories: ["TEST_REQUISICAO", "TESTE_REQUISICAO"],
+                    },
+                    {
+                        label: "Resposta",
+                        categories: ["TEST_RESPOSTA", "TESTE_RESPOSTA"],
+                    },
+                    {
+                        label: "Amostra",
+                        categories: ["TEST_AMOSTRA", "TESTE_AMOSTRA"],
+                    },
+                    {
+                        label: "Evidências",
+                        categories: ["TEST_EVIDENCIAS", "TESTE_EVIDENCIAS"],
+                    },
+                ];
+                if (showTestDetails) {
+                    attachmentGroups.forEach((group) => {
+                        const groupAtts = uniqueAttachmentsForEstimate.filter((att) => group.categories.includes(att.category));
+                        if (groupAtts.length === 0)
+                            return;
+                        estimatedHeight += 14; // spacing + header
+                        estimatedHeight += measureTextHeight(`Arquivos - ${group.label}`, {
                             width: innerW,
-                            font: "Helvetica",
-                            fontSize: 10,
-                            lineGap: 2,
+                            font: "Helvetica-Bold",
+                            fontSize: 10.5,
                         });
-                        if (att.referenceText) {
-                            estimatedHeight += measureTextHeight(`  Referência: ${att.referenceText}`, {
-                                width: innerW - 10,
+                        groupAtts.forEach((att) => {
+                            estimatedHeight += measureTextHeight(`• ${att.originalName}`, {
+                                width: innerW,
                                 font: "Helvetica",
-                                fontSize: 9.5,
+                                fontSize: 10,
                                 lineGap: 2,
                             });
-                        }
-                        estimatedHeight += 2;
+                            estimatedHeight += 2;
+                        });
                     });
                 }
                 estimatedHeight += boxPaddingY + 10; // bottom padding + after-box spacing
                 ensureSpace(Math.ceil(estimatedHeight));
                 const boxY = pdf.y;
                 pdf.y = boxY + boxPaddingY;
-                pdf
-                    .fillColor(textDark)
-                    .font("Helvetica-Bold")
-                    .fontSize(12)
-                    .text(`${index + 1}. ${ReportService.sanitizeQuestionTitle(question.texto)}`, innerX, pdf.y, {
-                    width: innerW,
-                    lineGap: 2,
-                });
-                pdf.moveDown(0.4);
                 pdf.fillColor(textMuted).font("Helvetica").fontSize(10);
-                kv("Aplicável", question.aplicavel ? "Sim" : "Não", innerX, innerW);
-                if (question.capitulacao)
-                    kv("Capitulação", question.capitulacao, innerX, innerW);
-                if (question.criticidade)
-                    kv("Criticidade", String(question.criticidade), innerX, innerW);
-                if (question.resposta)
-                    kv("Resposta", question.resposta, innerX, innerW);
-                if (question.respostaTexto)
-                    kv("Resposta (texto)", question.respostaTexto, innerX, innerW);
-                if (question.deficienciaTexto)
-                    kv("Deficiência", question.deficienciaTexto, innerX, innerW);
-                if (question.recomendacaoTexto)
-                    kv("Recomendação", question.recomendacaoTexto, innerX, innerW);
-                if (question.testStatus)
-                    kv("Teste (status)", String(question.testStatus), innerX, innerW);
-                if (question.testDescription)
-                    kv("Teste (descrição)", question.testDescription, innerX, innerW);
-                if (question.actionOrigem)
-                    kv("Plano de ação (origem)", question.actionOrigem, innerX, innerW);
-                if (question.actionResponsavel)
-                    kv("Plano de ação (responsável)", question.actionResponsavel, innerX, innerW);
-                if (question.actionDescricao)
-                    kv("Plano de ação (descrição)", question.actionDescricao, innerX, innerW);
-                if (question.actionDataApontamento) {
-                    kv("Plano de ação (data apontamento)", new Date(question.actionDataApontamento).toLocaleDateString("pt-BR"), innerX, innerW);
+                if (showTestDetails) {
+                    kv("Teste (descrição)", qRef.testDescription ? String(qRef.testDescription) : "-", innerX, innerW);
+                    kv("Referência (requisição)", qRef.requisicaoRef ? String(qRef.requisicaoRef) : "-", innerX, innerW);
+                    kv("Referência (resposta)", qRef.respostaTesteRef ? String(qRef.respostaTesteRef) : "-", innerX, innerW);
+                    kv("Referência (amostra)", qRef.amostraRef ? String(qRef.amostraRef) : "-", innerX, innerW);
+                    kv("Referência (evidências)", qRef.evidenciasRef ? String(qRef.evidenciasRef) : "-", innerX, innerW);
                 }
-                if (question.actionPrazoOriginal) {
-                    kv("Plano de ação (prazo original)", new Date(question.actionPrazoOriginal).toLocaleDateString("pt-BR"), innerX, innerW);
-                }
-                if (question.actionPrazoAtual) {
-                    kv("Plano de ação (prazo atual)", new Date(question.actionPrazoAtual).toLocaleDateString("pt-BR"), innerX, innerW);
-                }
-                if (question.actionComentarios)
-                    kv("Plano de ação (comentários)", question.actionComentarios, innerX, innerW);
                 const uniqueAtts = Array.from(atts
                     .reduce((acc, att) => {
                     acc.set(`${att.category}|${att.path}`, att);
                     return acc;
                 }, new Map())
                     .values());
-                if (uniqueAtts.length > 0) {
-                    pdf.moveDown(0.4);
-                    pdf
-                        .fillColor(textDark)
-                        .font("Helvetica-Bold")
-                        .fontSize(10.5)
-                        .text("Arquivos", innerX, pdf.y);
-                    pdf.moveDown(0.2);
-                    uniqueAtts.forEach((att, attIndex) => {
-                        ensureSpace(18);
-                        const link = ReportService.buildBuilderAttachmentLink(att, baseUrl);
+                if (showTestDetails) {
+                    attachmentGroups.forEach((group) => {
+                        const groupAtts = uniqueAtts.filter((att) => group.categories.includes(att.category));
+                        if (groupAtts.length === 0)
+                            return;
+                        pdf.moveDown(0.4);
                         pdf
-                            .fillColor(linkColor)
-                            .font("Helvetica")
-                            .fontSize(10)
-                            .text(`• [${att.category}] ${att.originalName}`, innerX, pdf.y, {
-                            width: innerW,
-                            link,
-                            underline: true,
-                            lineGap: 2,
-                        });
-                        pdf.fillColor(textMuted);
-                        if (att.referenceText) {
+                            .fillColor(textDark)
+                            .font("Helvetica-Bold")
+                            .fontSize(10.5)
+                            .text(`Arquivos - ${group.label}`, innerX, pdf.y);
+                        pdf.moveDown(0.2);
+                        groupAtts.forEach((att, attIndex) => {
+                            ensureSpace(18);
                             pdf
                                 .fillColor(textMuted)
                                 .font("Helvetica")
-                                .fontSize(9.5)
-                                .text(`  Referência: ${att.referenceText}`, innerX + 10, pdf.y, {
-                                width: innerW - 10,
+                                .fontSize(10)
+                                .text(`• ${att.originalName}`, innerX, pdf.y, {
+                                width: innerW,
                                 lineGap: 2,
                             });
-                        }
-                        // keep small spacing between attachments
-                        if (attIndex < uniqueAtts.length - 1)
-                            pdf.moveDown(0.1);
+                            if (attIndex < groupAtts.length - 1)
+                                pdf.moveDown(0.1);
+                        });
                     });
                 }
                 const boxEndY = pdf.y + boxPaddingY;
@@ -1388,7 +2613,255 @@ class ReportService {
                     .stroke();
                 pdf.y = boxEndY + 10;
             });
+            h3(`${itemPrefix}.1 Apontamentos`);
+            if (sectionDeficiencias.length === 0) {
+                p("Nenhuma deficiência identificada.");
+            }
+            else {
+                sectionDeficiencias.forEach((def, defIndex) => {
+                    ensureSpace(24);
+                    pdf
+                        .fillColor(textDark)
+                        .font("Helvetica-Bold")
+                        .fontSize(10.5)
+                        .text(`${defIndex + 1}. Deficiência: ${def.deficiencia}`, marginLeft, pdf.y, {
+                        width: contentWidth,
+                        lineGap: 2,
+                    });
+                    pdf.moveDown(0.2);
+                    if (def.criticidade) {
+                        pdf
+                            .fillColor(textMuted)
+                            .font("Helvetica")
+                            .fontSize(10.5)
+                            .text(`Criticidade: ${def.criticidade}`, marginLeft, pdf.y, {
+                            width: contentWidth,
+                            lineGap: 2,
+                        });
+                    }
+                    if (incluirRecomendacoes === "INCLUIR" && def.recomendacao) {
+                        pdf
+                            .fillColor(textMuted)
+                            .font("Helvetica")
+                            .fontSize(10.5)
+                            .text(`Recomendação: ${def.recomendacao}`, marginLeft, pdf.y, {
+                            width: contentWidth,
+                            lineGap: 2,
+                        });
+                    }
+                });
+            }
         });
+        titleBlock("5- CONCLUSÃO");
+        p("A tabela abaixo mostra a relação de deficiências e respectiva criticidade identificadas como resultado da avaliação dos diversos itens do Programa de PLD/FTP da Instituição.");
+        const conclusaoRows = ReportService.buildConclusaoRows(sections);
+        const drawConclusaoTable = (rows) => {
+            const labelWidth = 220;
+            const colWidth = Math.floor((contentWidth - labelWidth) / 4);
+            const paddingX = 6;
+            const paddingY = 6;
+            const fillHeader = "#F1F5F9";
+            const borderColor = "#94A3B8";
+            const fillBaixa = "#DCFCE7";
+            const fillMedia = "#FEF9C3";
+            const fillAlta = "#FEE2E2";
+            const drawRow = (values, isHeader) => {
+                const rowHeight = Math.max(measureTextHeight(values[0], {
+                    width: labelWidth - paddingX * 2,
+                    font: isHeader ? "Helvetica-Bold" : "Helvetica",
+                    fontSize: 10,
+                    lineGap: 1,
+                }), measureTextHeight(values[1], {
+                    width: colWidth - paddingX * 2,
+                    font: isHeader ? "Helvetica-Bold" : "Helvetica",
+                    fontSize: 10,
+                    lineGap: 1,
+                })) + paddingY * 2;
+                ensureSpace(rowHeight + 4);
+                const startY = pdf.y;
+                const fill = isHeader ? fillHeader : "#FFFFFF";
+                pdf.save();
+                pdf.fillColor(fill).rect(marginLeft, startY, labelWidth, rowHeight).fill();
+                pdf
+                    .fillColor(fillBaixa)
+                    .rect(marginLeft + labelWidth + 0 * colWidth, startY, colWidth, rowHeight)
+                    .fill();
+                pdf
+                    .fillColor(fillMedia)
+                    .rect(marginLeft + labelWidth + 1 * colWidth, startY, colWidth, rowHeight)
+                    .fill();
+                pdf
+                    .fillColor(fillAlta)
+                    .rect(marginLeft + labelWidth + 2 * colWidth, startY, colWidth, rowHeight)
+                    .fill();
+                pdf
+                    .fillColor(fill)
+                    .rect(marginLeft + labelWidth + 3 * colWidth, startY, colWidth, rowHeight)
+                    .fill();
+                pdf.restore();
+                pdf
+                    .strokeColor(borderColor)
+                    .rect(marginLeft, startY, contentWidth, rowHeight)
+                    .stroke();
+                for (let i = 0; i < 4; i++) {
+                    pdf
+                        .strokeColor(borderColor)
+                        .moveTo(marginLeft + labelWidth + i * colWidth, startY)
+                        .lineTo(marginLeft + labelWidth + i * colWidth, startY + rowHeight)
+                        .stroke();
+                }
+                pdf
+                    .fillColor(textDark)
+                    .font(isHeader ? "Helvetica-Bold" : "Helvetica")
+                    .fontSize(10)
+                    .text(values[0], marginLeft + paddingX, startY + paddingY, {
+                    width: labelWidth - paddingX * 2,
+                    lineGap: 1,
+                });
+                values.slice(1).forEach((val, idx) => {
+                    pdf
+                        .fillColor(textDark)
+                        .font(isHeader ? "Helvetica-Bold" : "Helvetica")
+                        .fontSize(10)
+                        .text(val, marginLeft + labelWidth + idx * colWidth + paddingX, startY + paddingY, {
+                        width: colWidth - paddingX * 2,
+                        align: "center",
+                        lineGap: 1,
+                    });
+                });
+                pdf.y = startY + rowHeight;
+            };
+            drawRow(["Item avaliado", "BAIXA", "MÉDIA", "ALTA", "TOTAL"], true);
+            rows.forEach((row) => {
+                drawRow([
+                    row.label,
+                    String(row.baixa),
+                    String(row.media),
+                    String(row.alta),
+                    String(row.total),
+                ], false);
+            });
+        };
+        const drawEvidenceAnnexTable = (rows) => {
+            const labelWidth = 220;
+            const filesWidth = contentWidth - labelWidth;
+            const paddingX = 6;
+            const paddingY = 6;
+            const fillHeader = "#F1F5F9";
+            const borderColor = "#94A3B8";
+            const drawRow = (label, files, isHeader) => {
+                const filesText = isHeader
+                    ? (files[0]?.name || "")
+                    : files.length
+                        ? files.map((f) => `• ${f.name}`).join("\n")
+                        : "-";
+                const rowHeight = Math.max(measureTextHeight(label, {
+                    width: labelWidth - paddingX * 2,
+                    font: isHeader ? "Helvetica-Bold" : "Helvetica",
+                    fontSize: 10,
+                    lineGap: 1,
+                }), measureTextHeight(filesText, {
+                    width: filesWidth - paddingX * 2,
+                    font: isHeader ? "Helvetica-Bold" : "Helvetica",
+                    fontSize: 10,
+                    lineGap: 2,
+                })) + paddingY * 2;
+                ensureSpace(rowHeight + 4);
+                const startY = pdf.y;
+                pdf.save();
+                pdf
+                    .fillColor(isHeader ? fillHeader : "#FFFFFF")
+                    .rect(marginLeft, startY, labelWidth, rowHeight)
+                    .fill();
+                pdf
+                    .fillColor(isHeader ? fillHeader : "#FFFFFF")
+                    .rect(marginLeft + labelWidth, startY, filesWidth, rowHeight)
+                    .fill();
+                pdf.restore();
+                pdf
+                    .strokeColor(borderColor)
+                    .rect(marginLeft, startY, contentWidth, rowHeight)
+                    .stroke();
+                pdf
+                    .strokeColor(borderColor)
+                    .moveTo(marginLeft + labelWidth, startY)
+                    .lineTo(marginLeft + labelWidth, startY + rowHeight)
+                    .stroke();
+                pdf
+                    .fillColor(textDark)
+                    .font(isHeader ? "Helvetica-Bold" : "Helvetica")
+                    .fontSize(10)
+                    .text(label, marginLeft + paddingX, startY + paddingY, {
+                    width: labelWidth - paddingX * 2,
+                    lineGap: 1,
+                });
+                if (isHeader) {
+                    pdf
+                        .fillColor(textDark)
+                        .font("Helvetica-Bold")
+                        .fontSize(10)
+                        .text(filesText, marginLeft + labelWidth + paddingX, startY + paddingY, {
+                        width: filesWidth - paddingX * 2,
+                        lineGap: 2,
+                    });
+                }
+                else if (files.length === 0) {
+                    pdf
+                        .fillColor(textDark)
+                        .font("Helvetica")
+                        .fontSize(10)
+                        .text("-", marginLeft + labelWidth + paddingX, startY + paddingY, {
+                        width: filesWidth - paddingX * 2,
+                        lineGap: 2,
+                    });
+                }
+                else {
+                    let cursorY = startY + paddingY;
+                    files.forEach((file) => {
+                        pdf
+                            .fillColor(linkColor)
+                            .font("Helvetica")
+                            .fontSize(10)
+                            .text(`• ${file.name}`, marginLeft + labelWidth + paddingX, cursorY, {
+                            width: filesWidth - paddingX * 2,
+                            lineGap: 2,
+                            link: file.url || undefined,
+                            underline: true,
+                        });
+                        cursorY = pdf.y;
+                    });
+                }
+                pdf.y = startY + rowHeight;
+            };
+            drawRow("Item avaliado", [{ name: "Arquivos", url: "" }], true);
+            rows.forEach((row) => drawRow(row.itemLabel, row.files, false));
+        };
+        drawConclusaoTable(conclusaoRows);
+        // Resultado da Avaliação (admin builder PDF) - renderizado apenas se mostrarMetodologia === 'MOSTRAR'
+        if (mostrarMetodologia === "MOSTRAR") {
+            const resultadoAvaliacao = ReportService.calcularResultadoAvaliacao(sections);
+            pdf.moveDown(0.6);
+            h3("Resultado da Avaliação");
+            pdf
+                .fillColor(textDark)
+                .font("Helvetica-Bold")
+                .fontSize(10)
+                .text("Resultado: ", marginLeft, pdf.y, { continued: true })
+                .font("Helvetica")
+                .text(resultadoAvaliacao.resultado, { lineGap: 2 });
+            pdf.moveDown(0.3);
+            p(resultadoAvaliacao.descricao);
+        }
+        const evidenceRows = ReportService.buildEvidenceAnnexRows(sections, "4", baseUrl);
+        pdf.moveDown(0.8);
+        titleBlock("6- ANEXO EVIDÊNCIAS");
+        p("A tabela abaixo apresenta os itens avaliados e todos os arquivos enviados (norma e demais anexos) relacionados às questões.");
+        if (evidenceRows.length > 0) {
+            drawEvidenceAnnexTable(evidenceRows);
+        }
+        else {
+            p("-");
+        }
         pdf.end();
         await new Promise((resolve, reject) => {
             stream.on("finish", () => resolve());
@@ -1465,6 +2938,7 @@ class ReportService {
             const filename = `pld-report-${userId}-${timestamp}.docx`;
             const filePath = path_1.default.join(reportsDir, filename);
             const doc = new docx_1.Document({
+                styles: ReportService.buildDocxStyles(),
                 sections: [
                     {
                         properties: {},

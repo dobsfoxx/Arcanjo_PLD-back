@@ -253,29 +253,6 @@ router.post('/forms/:id/send', auth_1.authenticate, auth_1.requireBuilderAccess,
         res.status(400).json({ error: error.message });
     }
 });
-// ADMIN: Aprovar formulário
-router.post('/forms/:id/approve', auth_1.authenticate, auth_1.requireBuilderAccess, async (req, res) => {
-    try {
-        const { id } = req.params;
-        await pldBuilder_service_1.PldBuilderService.approveForm(id, req.user);
-        res.json({ message: 'Formulário aprovado com sucesso' });
-    }
-    catch (error) {
-        res.status(400).json({ error: error.message });
-    }
-});
-// ADMIN: Devolver formulário para usuário
-router.post('/forms/:id/return', auth_1.authenticate, auth_1.requireBuilderAccess, async (req, res) => {
-    try {
-        const { id } = req.params;
-        const { reason } = req.body;
-        await pldBuilder_service_1.PldBuilderService.returnForm(id, req.user, reason);
-        res.json({ message: 'Formulário devolvido com sucesso' });
-    }
-    catch (error) {
-        res.status(400).json({ error: error.message });
-    }
-});
 // USER: Obter formulário atribuído
 router.get('/forms/:id/user', auth_1.authenticate, async (req, res) => {
     try {
@@ -299,18 +276,6 @@ router.post('/forms/:id/responses', auth_1.authenticate, async (req, res) => {
         res.status(400).json({ error: error.message });
     }
 });
-// USER: Enviar para revisão
-router.post('/forms/:id/submit', auth_1.authenticate, async (req, res) => {
-    try {
-        const { id } = req.params;
-        const { answers, sections, metadata } = req.body;
-        await pldBuilder_service_1.PldBuilderService.submitUserFormForReview(id, req.user.email, answers, sections, metadata);
-        res.json({ message: 'Formulário enviado para revisão com sucesso' });
-    }
-    catch (error) {
-        res.status(400).json({ error: error.message });
-    }
-});
 // USER: Concluir formulário (somente quando 100% preenchido)
 router.post('/forms/:id/complete', auth_1.authenticate, async (req, res) => {
     try {
@@ -320,6 +285,21 @@ router.post('/forms/:id/complete', auth_1.authenticate, async (req, res) => {
     }
     catch (error) {
         res.status(400).json({ error: error.message });
+    }
+});
+// USER: Remover formulário da lista do usuário (não deleta permanentemente)
+router.delete('/forms/:id/user', auth_1.authenticate, async (req, res) => {
+    try {
+        const { id } = req.params;
+        const userEmail = req.user?.email;
+        if (!userEmail) {
+            return res.status(401).json({ error: 'Usuário não autenticado' });
+        }
+        await pldBuilder_service_1.PldBuilderService.deleteUserForm(id, userEmail);
+        res.json({ message: 'Formulário removido com sucesso' });
+    }
+    catch (error) {
+        res.status(400).json({ error: (0, publicError_1.toPublicErrorMessage)(error, 'Erro ao remover formulário') });
     }
 });
 // USER: Upload de arquivo para uma questão do formulário

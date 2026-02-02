@@ -10,8 +10,10 @@ exports.requireAdmin = requireAdmin;
 exports.requireBuilderAccess = requireBuilderAccess;
 const jsonwebtoken_1 = __importDefault(require("jsonwebtoken"));
 const database_1 = __importDefault(require("../config/database"));
+// Tempo de expiração do token (padrão: 8 horas)
 const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || '8h';
 const rawSecret = process.env.JWT_SECRET;
+// Validação obrigatória do JWT_SECRET em produção
 if (!rawSecret) {
     if (process.env.NODE_ENV === 'production') {
         throw new Error('JWT_SECRET is required in production');
@@ -19,11 +21,21 @@ if (!rawSecret) {
     console.warn('[SECURITY] JWT_SECRET is not set; using a dev-only fallback secret');
 }
 const JWT_SECRET = (rawSecret || 'dev-only-change-me');
+/**
+ * Gera um token JWT para o usuário especificado
+ * @param userId - ID do usuário para incluir no token
+ * @returns Token JWT assinado
+ */
 function signToken(userId) {
     return jsonwebtoken_1.default.sign({ userId }, JWT_SECRET, {
         expiresIn: JWT_EXPIRES_IN,
+        algorithm: 'HS256',
     });
 }
+/**
+ * Middleware principal de autenticação
+ * Valida o token e carrega os dados do usuário na requisição
+ */
 async function authenticate(req, res, next) {
     try {
         const token = getTokenFromRequest(req);
@@ -32,11 +44,12 @@ async function authenticate(req, res, next) {
         }
         let payload;
         try {
-            payload = jsonwebtoken_1.default.verify(token, JWT_SECRET);
+            payload = jsonwebtoken_1.default.verify(token, JWT_SECRET, { algorithms: ['HS256'] });
         }
         catch {
             return res.status(401).json({ error: 'Token inválido ou expirado' });
         }
+        // Busca dados completos do usuário no banco
         const user = await database_1.default.user.findUnique({
             where: { id: payload.userId },
             select: {
@@ -96,7 +109,7 @@ async function authenticateFromHeaderOrQuery(req, res, next) {
         }
         let payload;
         try {
-            payload = jsonwebtoken_1.default.verify(token, JWT_SECRET);
+            payload = jsonwebtoken_1.default.verify(token, JWT_SECRET, { algorithms: ['HS256'] });
         }
         catch {
             return res.status(401).json({ error: 'Token inválido ou expirado' });
