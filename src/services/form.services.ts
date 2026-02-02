@@ -1,15 +1,34 @@
+/**
+ * FormService - Serviço de Gerenciamento de Formulários PLD
+ * 
+ * Este serviço gerencia todas as operações relacionadas a formulários,
+ * tópicos, questões, respostas e evidências no sistema PLD.
+ * 
+ * Principais funcionalidades:
+ * - CRUD de tópicos e questões
+ * - Gerenciamento de respostas e evidências
+ * - Controle de atribuições de formulários
+ * - Upload e exclusão de arquivos
+ */
 import prisma from '../config/database'
 
 export class FormService {
   // =========== TÓPICOS ===========
 
+  /**
+   * Cria um novo tópico no formulário
+   * @param userId - ID do usuário criador
+   * @param name - Nome do tópico
+   * @param description - Descrição opcional
+   * @param internalNorm - Norma interna relacionada
+   */
   static async createTopic(
     userId: string,
     name: string,
     description?: string,
     internalNorm?: string
   ) {
-    // Contar tópicos para definir ordem
+    // Conta tópicos existentes para definir ordem
     const count = await prisma.topic.count()
 
     return await prisma.topic.create({
@@ -23,8 +42,10 @@ export class FormService {
     })
   }
 
-  // Listar tópicos com perguntas, trazendo apenas a resposta do usuário atual.
-  // ADMIN vê todos os tópicos; USER só vê tópicos atribuídos a ele.
+  /**
+   * Lista tópicos com perguntas e respostas do usuário atual
+   * ADMIN vê todos os tópicos; USER vê apenas os atribuídos a ele
+   */
   static async getTopics(userId: string, role: string) {
     const where: any = { isActive: true }
 
@@ -53,7 +74,7 @@ export class FormService {
       orderBy: { order: 'asc' },
     })
 
-    // Tópico e pergunta(usuario)
+    // Adapta estrutura de tópico e pergunta para o frontend
     const adapted = (topics as any[]).map((topic: any) => ({
       ...topic,
       questions: (topic.questions as any[]).map((question: any) => {

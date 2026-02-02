@@ -1,15 +1,30 @@
+/**
+ * Middleware de Autenticação JWT
+ * 
+ * Este módulo gerencia toda a autenticação do sistema PLD,
+ * incluindo geração e validação de tokens JWT, verificação
+ * de assinaturas e controle de acesso baseado em roles.
+ * 
+ * Tokens podem ser enviados via:
+ * - Header Authorization: Bearer <token>
+ * - Cookie HttpOnly: pld_token
+ * - Query string: ?token=<token> (apenas para downloads)
+ */
 import { Request, Response, NextFunction } from 'express'
 import jwt, { Secret } from 'jsonwebtoken'
 import prisma from '../config/database'
 
+// Estrutura do payload do token JWT
 interface JwtPayload {
   userId: string
 }
 
+// Tempo de expiração do token (padrão: 8 horas)
 const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || '8h'
 
 const rawSecret = process.env.JWT_SECRET
 
+// Validação obrigatória do JWT_SECRET em produção
 if (!rawSecret) {
   if (process.env.NODE_ENV === 'production') {
     throw new Error('JWT_SECRET is required in production')
@@ -19,12 +34,22 @@ if (!rawSecret) {
 
 const JWT_SECRET: Secret = (rawSecret || 'dev-only-change-me') as Secret
 
+/**
+ * Gera um token JWT para o usuário especificado
+ * @param userId - ID do usuário para incluir no token
+ * @returns Token JWT assinado
+ */
 export function signToken(userId: string) {
   return (jwt as any).sign({ userId } as JwtPayload, JWT_SECRET, {
     expiresIn: JWT_EXPIRES_IN,
+    algorithm: 'HS256',
   })
 }
 
+/**
+ * Middleware principal de autenticação
+ * Valida o token e carrega os dados do usuário na requisição
+ */
 export async function authenticate(req: Request, res: Response, next: NextFunction) {
   try {
     const token = getTokenFromRequest(req)
@@ -35,11 +60,12 @@ export async function authenticate(req: Request, res: Response, next: NextFuncti
 
     let payload: JwtPayload
     try {
-      payload = jwt.verify(token, JWT_SECRET) as JwtPayload
+      payload = jwt.verify(token, JWT_SECRET, { algorithms: ['HS256'] }) as JwtPayload
     } catch {
       return res.status(401).json({ error: 'Token inválido ou expirado' })
     }
 
+    // Busca dados completos do usuário no banco
     const user = await prisma.user.findUnique({
       where: { id: payload.userId },
       select: {
@@ -109,7 +135,7 @@ export async function authenticateFromHeaderOrQuery(req: Request, res: Response,
 
     let payload: JwtPayload
     try {
-      payload = jwt.verify(token, JWT_SECRET) as JwtPayload
+      payload = jwt.verify(token, JWT_SECRET, { algorithms: ['HS256'] }) as JwtPayload
     } catch {
       return res.status(401).json({ error: 'Token inválido ou expirado' })
     }

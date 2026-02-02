@@ -2,6 +2,8 @@ import express from 'express'
 import cors from 'cors'
 import helmet from 'helmet'
 import morgan from 'morgan'
+import rateLimit from 'express-rate-limit'
+import hpp from 'hpp'
 import { config } from 'dotenv'
 import path from 'path'
 import multer from 'multer'
@@ -17,8 +19,20 @@ config()
 
 const app = express()
 
+const trustProxyValue = process.env.TRUST_PROXY
+if (trustProxyValue) {
+  const parsed = Number.parseInt(trustProxyValue, 10)
+  app.set('trust proxy', Number.isFinite(parsed) ? parsed : 1)
+} else if (process.env.NODE_ENV === 'production') {
+  app.set('trust proxy', 1)
+}
+
 // Segurança básica
-app.use(helmet())
+app.use(
+  helmet({
+    crossOriginResourcePolicy: { policy: 'cross-origin' },
+  })
+)
 
 // Não expor assinatura do framework
 app.disable('x-powered-by')
@@ -44,8 +58,23 @@ app.use(
 
       return cb(null, corsAllowlist.includes(origin))
     },
+    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'X-Bootstrap-Token'],
   })
 )
+
+// Proteção contra HTTP Parameter Pollution
+app.use(hpp())
+
+// Rate limit geral da API
+const apiLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 300,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Muitas requisições. Tente novamente em instantes.' },
+})
+app.use('/api', apiLimiter)
 
 // Logs de requisição
 app.use(morgan('combined'))
@@ -54,7 +83,8 @@ app.use(morgan('combined'))
 app.post('/api/billing/webhook', express.raw({ type: 'application/json' }), billingWebhookHandler)
 
 // Body parser
-app.use(express.json({ limit: '10mb' }))
+app.use(express.json({ limit: process.env.JSON_LIMIT || '5mb' }))
+app.use(express.urlencoded({ extended: false, limit: process.env.URLENCODED_LIMIT || '1mb' }))
 
 // Cookies (para auth via HttpOnly cookie)
 app.use(cookieParser())

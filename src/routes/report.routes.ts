@@ -19,7 +19,7 @@ router.get('/me', authenticate, async (req, res) => {
     const typeParam = (req.query.type as string | undefined)?.toUpperCase()
     const type = typeParam === 'PARTIAL' ? 'PARTIAL' : 'FULL'
     const formatParam = (req.query.format as string | undefined)?.toUpperCase()
-    const format = formatParam === 'DOCX' ? 'DOCX' : 'PDF'
+    const format = formatParam === 'PDF' ? 'PDF' : 'DOCX'
 
     const topicIdsRaw = (req.query.topicIds as string | undefined) ?? undefined
     const topicIds = topicIdsRaw
@@ -62,7 +62,7 @@ router.get('/user/:id', authenticate, async (req, res) => {
     const typeParam = (req.query.type as string | undefined)?.toUpperCase()
     const type = typeParam === 'PARTIAL' ? 'PARTIAL' : 'FULL'
     const formatParam = (req.query.format as string | undefined)?.toUpperCase()
-    const format = formatParam === 'DOCX' ? 'DOCX' : 'PDF'
+    const format = formatParam === 'PDF' ? 'PDF' : 'DOCX'
 
     const topicIdsRaw = (req.query.topicIds as string | undefined) ?? undefined
     const topicIds = topicIdsRaw
@@ -129,7 +129,7 @@ router.get('/forms/:id', authenticate, async (req, res) => {
   try {
     const { id } = req.params
     const formatParam = (req.query.format as string | undefined)?.toUpperCase()
-    const format = formatParam === 'DOCX' ? 'DOCX' : 'PDF'
+    const format = formatParam === 'PDF' ? 'PDF' : 'DOCX'
 
     const report = await ReportService.generatePldUserFormReport(id, {
       requesterId: req.user!.id,

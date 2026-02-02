@@ -1,17 +1,74 @@
 import express from 'express'
+import { OAuth2Client } from 'google-auth-library'
+import rateLimit from 'express-rate-limit'
 import { AuthService } from '../services/auth.service'
 import { authenticate, requireAdmin } from '../middleware/auth'
+import { validateBody } from '../middleware/validate'
+import {
+  bootstrapAdminSchema,
+  forgotPasswordSchema,
+  googleSchema,
+  loginSchema,
+  registerSchema,
+  resetPasswordSchema,
+} from '../validators/auth.schemas'
 import prisma from '../config/database'
 
 const router = express.Router()
 
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Muitas tentativas. Aguarde alguns minutos e tente novamente.' },
+})
+
+const passwordLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Muitas tentativas. Tente novamente mais tarde.' },
+})
+
+const googleClientId = (process.env.GOOGLE_CLIENT_ID || '').trim()
+const googleClient = googleClientId ? new OAuth2Client(googleClientId) : null
+
+function requireBootstrapToken(req: express.Request, res: express.Response): boolean {
+  const allowBootstrap = (process.env.ALLOW_BOOTSTRAP_ADMIN || '').toLowerCase() === 'true'
+  if (!allowBootstrap && process.env.NODE_ENV === 'production') {
+    res.status(403).json({ error: 'Bootstrap admin desativado' })
+    return false
+  }
+
+  const expected = (process.env.BOOTSTRAP_ADMIN_TOKEN || '').trim()
+  if (!expected) {
+    if (process.env.NODE_ENV === 'production') {
+      res.status(403).json({ error: 'Bootstrap admin requer token' })
+      return false
+    }
+    return true
+  }
+
+  const provided = (req.headers['x-bootstrap-token'] as string | undefined)?.trim()
+  if (!provided || provided !== expected) {
+    res.status(403).json({ error: 'Token de bootstrap inválido' })
+    return false
+  }
+
+  return true
+}
+
 function setAuthCookie(res: express.Response, token: string) {
   const isProd = process.env.NODE_ENV === 'production'
+  const maxAgeMs = Number.parseInt(process.env.JWT_COOKIE_MAX_AGE_MS || '', 10)
   res.cookie('pld_token', token, {
     httpOnly: true,
     sameSite: 'lax',
     secure: isProd,
     path: '/',
+    ...(Number.isFinite(maxAgeMs) && maxAgeMs > 0 ? { maxAge: maxAgeMs } : {}),
   })
 }
 
@@ -25,7 +82,7 @@ function clearAuthCookie(res: express.Response) {
   })
 }
 
-router.post('/register', async (req, res) => {
+router.post('/register', authLimiter, validateBody(registerSchema), async (req, res) => {
   try {
     const { name, email, password, startTrial } = req.body
 
@@ -46,14 +103,15 @@ router.post('/register', async (req, res) => {
     console.error('[AUTH] register failed:', error)
     const msg = typeof error?.message === 'string' ? error.message : ''
     const safeMessage =
-      msg === 'E-mail já está em uso' || msg === 'A senha deve ter pelo menos 8 caracteres'
+      msg === 'E-mail já está em uso' ||
+      msg === 'A senha deve ter pelo menos 8 caracteres e conter letra maiúscula, minúscula, número e símbolo'
         ? msg
         : 'Erro ao registrar usuário'
     res.status(400).json({ error: safeMessage })
   }
 })
 
-router.post('/login', async (req, res) => {
+router.post('/login', authLimiter, validateBody(loginSchema), async (req, res) => {
   try {
     const { email, password } = req.body
 
@@ -78,8 +136,9 @@ router.post('/login', async (req, res) => {
 })
 
 // Endpoint para criação do primeiro administrador
-router.post('/bootstrap-admin', async (req, res) => {
+router.post('/bootstrap-admin', authLimiter, validateBody(bootstrapAdminSchema), async (req, res) => {
   try {
+    if (!requireBootstrapToken(req, res)) return
     const { name, email, password } = req.body
 
     if (!name || !email || !password) {
@@ -98,7 +157,8 @@ router.post('/bootstrap-admin', async (req, res) => {
     console.error('[AUTH] bootstrap-admin failed:', error)
     const msg = typeof error?.message === 'string' ? error.message : ''
     const safeMessage =
-      msg === 'Já existe um administrador cadastrado' || msg === 'Senha do administrador deve ter pelo menos 10 caracteres'
+      msg === 'Já existe um administrador cadastrado' ||
+      msg === 'Senha do administrador deve ter pelo menos 12 caracteres e conter letra maiúscula, minúscula, número e símbolo'
         ? msg
         : 'Erro ao criar administrador'
     res.status(400).json({ error: safeMessage })
@@ -106,7 +166,7 @@ router.post('/bootstrap-admin', async (req, res) => {
 })
 
 // Esqueci minha senha - solicita envio de e-mail com link de recuperação
-router.post('/forgot-password', async (req, res) => {
+router.post('/forgot-password', passwordLimiter, validateBody(forgotPasswordSchema), async (req, res) => {
   try {
     const { email } = req.body
 
@@ -125,7 +185,7 @@ router.post('/forgot-password', async (req, res) => {
 })
 
 // Redefinir senha usando token recebido por e-mail
-router.post('/reset-password', async (req, res) => {
+router.post('/reset-password', passwordLimiter, validateBody(resetPasswordSchema), async (req, res) => {
   try {
     const { token, password } = req.body
 
@@ -139,7 +199,8 @@ router.post('/reset-password', async (req, res) => {
     console.error('[AUTH] reset-password failed:', error)
     const msg = typeof error?.message === 'string' ? error.message : ''
     const safeMessage =
-      msg === 'A nova senha deve ter pelo menos 8 caracteres' || msg === 'Token de recuperação inválido ou expirado'
+      msg === 'A senha deve ter pelo menos 8 caracteres e conter letra maiúscula, minúscula, número e símbolo' ||
+      msg === 'Token de recuperação inválido ou expirado'
         ? msg
         : 'Erro ao redefinir senha'
     res.status(400).json({ error: safeMessage })
@@ -147,20 +208,26 @@ router.post('/reset-password', async (req, res) => {
 })
 
 // Login com Google OAuth
-router.post('/google', async (req, res) => {
+router.post('/google', authLimiter, validateBody(googleSchema), async (req, res) => {
   try {
     const { credential } = req.body
 
-    if (!credential) {
-      return res.status(400).json({ error: 'Credential do Google é obrigatório' })
+    let payload: any | null = null
+    if (googleClient) {
+      const ticket = await googleClient.verifyIdToken({
+        idToken: credential,
+        audience: googleClientId,
+      })
+      payload = ticket.getPayload() || null
+    } else {
+      if (process.env.NODE_ENV === 'production') {
+        return res.status(500).json({ error: 'Google Client ID não configurado' })
+      }
+      const base64Payload = credential.split('.')[1]
+      payload = JSON.parse(Buffer.from(base64Payload, 'base64').toString('utf-8'))
     }
 
-    // Decodifica o JWT do Google (em produção, você deve verificar a assinatura)
-    // O credential é um JWT que contém as informações do usuário
-    const base64Payload = credential.split('.')[1]
-    const payload = JSON.parse(Buffer.from(base64Payload, 'base64').toString('utf-8'))
-
-    const { email, name, picture, email_verified } = payload
+    const { email, name, picture, email_verified } = payload || {}
 
     if (!email_verified) {
       return res.status(400).json({ error: 'E-mail do Google não verificado' })

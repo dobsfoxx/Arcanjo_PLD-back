@@ -331,6 +331,21 @@ router.post('/forms/:id/complete', authenticate, async (req, res) => {
   }
 })
 
+// USER: Remover formulário da lista do usuário (não deleta permanentemente)
+router.delete('/forms/:id/user', authenticate, async (req, res) => {
+  try {
+    const { id } = req.params
+    const userEmail = req.user?.email
+    if (!userEmail) {
+      return res.status(401).json({ error: 'Usuário não autenticado' })
+    }
+    await PldBuilderService.deleteUserForm(id, userEmail)
+    res.json({ message: 'Formulário removido com sucesso' })
+  } catch (error: any) {
+    res.status(400).json({ error: toPublicErrorMessage(error, 'Erro ao remover formulário') })
+  }
+})
+
 // USER: Upload de arquivo para uma questão do formulário
 router.post('/forms/:id/upload', authenticate, upload.single('file'), async (req, res) => {
   try {

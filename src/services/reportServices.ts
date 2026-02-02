@@ -1,3 +1,16 @@
+/**
+ * ReportService - Serviço de Geração de Relatórios PLD
+ * 
+ * Este serviço é responsável por gerar relatórios de avaliação de PLD
+ * em formato PDF. Processa os dados do formulário e cria documentos
+ * formatados com seções, questões, deficiências e anexos de evidências.
+ * 
+ * Principais funcionalidades:
+ * - Geração de relatórios PDF completos
+ * - Tabelas de critérios (criticidade, efetividade)
+ * - Anexo de evidências com links para arquivos
+ * - Suporte a múltiplas instituições avaliadas
+ */
 import fs from "fs";
 import path from "path";
 import PDFDocument from "pdfkit";
@@ -24,17 +37,26 @@ import { getReportsDir } from "../config/paths";
 import { getStorageProvider, uploadFileToStorage } from "../config/storage";
 
 export class ReportService {
+  /**
+   * Sanitiza o título da questão removendo espaços e validando o tipo
+   */
   private static sanitizeQuestionTitle(raw: unknown): string {
     if (typeof raw !== "string") return "-";
     const title = raw.trim();
     return title || "-";
   }
 
+  /**
+   * Formata data para o padrão brasileiro (DD/MM/AAAA)
+   */
   private static formatDatePtBr(date: Date): string {
     if (!(date instanceof Date) || Number.isNaN(date.getTime())) return "-";
     return date.toLocaleDateString("pt-BR");
   }
 
+  /**
+   * Extrai labels das seções para exibição no relatório
+   */
   private static getSectionLabels(sections: any[]) {
     return sections.map((section) => {
       const label = (section?.customLabel || "").trim()
@@ -44,6 +66,14 @@ export class ReportService {
     });
   }
 
+  /**
+   * Coleta todas as deficiências identificadas nas questões
+   * para gerar a tabela de conclusão do relatório
+   * 
+   * Uma deficiência é identificada quando:
+   * - A resposta é "Não" (NAO)
+   * - A criticidade está definida
+   */
   private static collectDeficiencias(sections: any[]) {
     const items: Array<{
       sectionLabel: string;
@@ -57,12 +87,32 @@ export class ReportService {
         ? `${section.item} - ${section.customLabel}`
         : section?.item;
       (section?.questions || []).forEach((question: any) => {
-        if (!question?.deficienciaTexto) return;
+        // Verifica se é uma deficiência: resposta "Não" + criticidade definida
+        const resposta = (question?.resposta || "").toString().trim();
+        // Normaliza para comparação: remove acentos e converte para minúsculas
+        const respostaNormalized = resposta
+          .toLowerCase()
+          .normalize("NFD")
+          .replace(/[\u0300-\u036f]/g, "");
+        
+        // Verifica se é "Não" (nao, não, n) e NÃO é "Sim" (sim, s)
+        const isRespostaNao = respostaNormalized === "nao" || respostaNormalized === "n";
+        const isRespostaSim = respostaNormalized === "sim" || respostaNormalized === "s";
+        
+        // Se for "Sim" ou não for "Não", pula
+        if (isRespostaSim || !isRespostaNao) return;
+        
+        const criticidade = (question?.criticidade || "").toString().toUpperCase().trim();
+        const hasCriticidade = criticidade === "ALTA" || criticidade === "MEDIA" || criticidade === "BAIXA";
+        
+        // Só inclui se tem resposta "Não" e criticidade definida
+        if (!hasCriticidade) return;
+        
         items.push({
           sectionLabel: sectionLabel || "-",
           questionTitle: ReportService.sanitizeQuestionTitle(question?.texto),
-          deficiencia: String(question.deficienciaTexto),
-          criticidade: question?.criticidade ? String(question.criticidade) : undefined,
+          deficiencia: question?.deficienciaTexto ? String(question.deficienciaTexto) : "-",
+          criticidade: criticidade,
           recomendacao: question?.recomendacaoTexto
             ? String(question.recomendacaoTexto)
             : undefined,
@@ -72,14 +122,348 @@ export class ReportService {
     return items;
   }
 
+  /**
+   * Calcula o resultado da avaliação de efetividade baseado nas deficiências de alta criticidade
+   * em itens específicos: MSAC, CSNU e CSC
+   * 
+   * Uma deficiência é identificada quando:
+   * - A resposta da pergunta é "Não"
+   * - A criticidade é "ALTA"
+   * 
+   * - EFETIVO: Nenhuma deficiência de alta criticidade nos 3 itens
+   * - PARCIALMENTE EFETIVO: Deficiências de alta criticidade em até 2 dos itens
+   * - POUCO EFETIVO: Deficiências de alta criticidade nos 3 itens
+   */
+  private static calcularResultadoAvaliacao(sections: any[]): {
+    resultado: "EFETIVO" | "PARCIALMENTE EFETIVO" | "POUCO EFETIVO";
+    descricao: string;
+    detalhes: {
+      msacComAltaCriticidade: boolean;
+      csnuComAltaCriticidade: boolean;
+      cscComAltaCriticidade: boolean;
+    };
+  } {
+    // Palavras-chave para identificar cada tipo de item
+    const msacKeywords = ["msac", "monitoramento", "seleção", "análise", "comunicação", "operações atípicas", "operações suspeitas"];
+    const csnuKeywords = ["csnu", "sanções", "lei 13.810", "resolução bcb 44", "instrução normativa bcb 262"];
+    const cscKeywords = ["conheça seu cliente", "csc", "kyc", "know your customer"];
+
+    const normalizeText = (text: string) =>
+      (text || "")
+        .toLowerCase()
+        .normalize("NFD")
+        .replace(/[\u0300-\u036f]/g, "");
+
+    const containsKeyword = (text: string, keywords: string[]) => {
+      const normalized = normalizeText(text);
+      return keywords.some((keyword) => normalized.includes(normalizeText(keyword)));
+    };
+
+    // Verifica se a resposta indica "Não" (deficiência identificada)
+    const isRespostaNao = (resposta: any): boolean => {
+      const normalizedResposta = normalizeText(String(resposta || ""));
+      // Após normalizeText, "não" vira "nao", então só comparamos com "nao" e "n"
+      return normalizedResposta === "nao" || normalizedResposta === "n";
+    };
+
+    let msacComAltaCriticidade = false;
+    let csnuComAltaCriticidade = false;
+    let cscComAltaCriticidade = false;
+
+    sections.forEach((section) => {
+      const sectionLabel = (section?.customLabel || section?.item || "").toString();
+      const sectionDescricao = (section?.descricao || "").toString();
+      const sectionContext = `${sectionLabel} ${sectionDescricao}`;
+
+      (section?.questions || []).forEach((question: any) => {
+        if (question?.aplicavel === false) return;
+        
+        // Verifica se é uma deficiência: resposta = "Não"
+        const resposta = question?.resposta;
+        if (!isRespostaNao(resposta)) return;
+        
+        // Verifica se a criticidade é ALTA
+        const criticidade = String(question?.criticidade || "").toUpperCase();
+        if (criticidade !== "ALTA") return;
+
+        // Se há deficiência de alta criticidade, verificar em qual categoria se encaixa
+        const questionTexto = (question?.texto || "").toString();
+        const questionDesc = (question?.descricao || "").toString();
+        const deficienciaTexto = (question?.deficienciaTexto || "").toString();
+        const fullContext = `${sectionContext} ${questionTexto} ${questionDesc} ${deficienciaTexto}`;
+
+        if (containsKeyword(fullContext, msacKeywords)) {
+          msacComAltaCriticidade = true;
+        }
+        if (containsKeyword(fullContext, csnuKeywords)) {
+          csnuComAltaCriticidade = true;
+        }
+        if (containsKeyword(fullContext, cscKeywords)) {
+          cscComAltaCriticidade = true;
+        }
+      });
+    });
+
+    const countItensComAltaCriticidade = [msacComAltaCriticidade, csnuComAltaCriticidade, cscComAltaCriticidade].filter(Boolean).length;
+
+    let resultado: "EFETIVO" | "PARCIALMENTE EFETIVO" | "POUCO EFETIVO";
+    let descricao: string;
+
+    if (countItensComAltaCriticidade <= 1) {
+      // EFETIVO: 0 ou 1 item com deficiência de alta criticidade
+      resultado = "EFETIVO";
+      descricao =
+        "O programa de PLD/FTP atingiu a maioria dos resultados esperados, sem a identificação de deficiências de alta criticidade nos procedimentos de monitoramento, seleção, análise e comunicação de operações atípicas (MSAC), nos procedimentos de verificação de sanções CSNU, e nos procedimentos conheça seu cliente (CSC).";
+    } else if (countItensComAltaCriticidade === 2) {
+      // PARCIALMENTE EFETIVO: exatamente 2 dos 3 itens com deficiência de alta criticidade
+      resultado = "PARCIALMENTE EFETIVO";
+      descricao =
+        "O programa de PLD/FTP atingiu a maioria dos resultados esperados, porém foram identificadas deficiências de alta criticidade em alguns dos procedimentos avaliados (MSAC, CSNU ou CSC).";
+    } else {
+      // POUCO EFETIVO: 3 itens com deficiência de alta criticidade
+      resultado = "POUCO EFETIVO";
+      descricao =
+        "O programa de PLD/FTP não atingiu a maioria dos resultados esperados, com a identificação de deficiências de alta criticidade nos procedimentos de monitoramento, seleção, análise e comunicação de operações atípicas (MSAC), nos procedimentos de verificação de sanções CSNU, e nos procedimentos conheça seu cliente (CSC).";
+    }
+
+    return {
+      resultado,
+      descricao,
+      detalhes: {
+        msacComAltaCriticidade,
+        csnuComAltaCriticidade,
+        cscComAltaCriticidade,
+      },
+    };
+  }
+
+  private static buildEvidenceAnnexRows(
+    sections: any[],
+    executionPrefix: string,
+    baseUrl: string
+  ) {
+    return (sections || []).map((section: any, sectionIndex: number) => {
+      const sectionLabel = (section?.customLabel || "").trim()
+        ? `${section.item} - ${section.customLabel}`
+        : section?.item || "-";
+      const itemLabel = `${executionPrefix}.${sectionIndex + 1} ${sectionLabel || "-"}`;
+
+      const sectionAtts = Array.isArray(section?.attachments) ? section.attachments : [];
+      const questionAtts = Array.isArray(section?.questions)
+        ? section.questions.flatMap((q: any) =>
+            Array.isArray(q?.attachments) ? q.attachments : []
+          )
+        : [];
+      const uniqueAtts = Array.from(
+        [...sectionAtts, ...questionAtts]
+          .reduce((acc: Map<string, any>, att: any) => {
+            const key = `${att?.category || ""}|${att?.path || ""}|${att?.originalName || ""}|${att?.filename || ""}`;
+            acc.set(key, att);
+            return acc;
+          }, new Map<string, any>())
+          .values()
+      );
+
+      const files = uniqueAtts.map((att: any) => {
+        const name =
+          att?.originalName ||
+          att?.filename ||
+          (typeof att?.path === "string" ? path.basename(att.path) : "");
+        const url = ReportService.buildEvidenceLink(att, baseUrl);
+        return { name: String(name || "Arquivo"), url };
+      });
+
+      return { itemLabel, files };
+    });
+  }
+
+  private static buildEvidenceAnnexTableDocx(
+    rows: Array<{ itemLabel: string; files: Array<{ name: string; url: string }> }>
+  ) {
+    const tableWidth = 9360;
+    const col1Width = 3200;
+    const col2Width = tableWidth - col1Width;
+
+    // Header da tabela com fundo azul escuro
+    const headerRow = new TableRow({
+      tableHeader: true,
+      children: [
+        new TableCell({
+          width: { size: col1Width, type: WidthType.DXA },
+          shading: { type: ShadingType.CLEAR, color: "auto", fill: "1E3A5F" },
+          margins: { top: 100, bottom: 100, left: 120, right: 120 },
+          children: [
+            new Paragraph({
+              children: [new TextRun({ text: "Item Avaliado", bold: true, color: "FFFFFF", size: 22 })],
+            }),
+          ],
+        }),
+        new TableCell({
+          width: { size: col2Width, type: WidthType.DXA },
+          shading: { type: ShadingType.CLEAR, color: "auto", fill: "1E3A5F" },
+          margins: { top: 100, bottom: 100, left: 120, right: 120 },
+          children: [
+            new Paragraph({
+              children: [new TextRun({ text: "Arquivos Anexados", bold: true, color: "FFFFFF", size: 22 })],
+            }),
+          ],
+        }),
+      ],
+    });
+
+    // Linhas de dados com cores alternadas
+    const dataRows = rows.map((row, idx) => {
+      const bgColor = idx % 2 === 0 ? "F8FAFC" : "FFFFFF";
+      
+      // Cria os parágrafos com links para cada arquivo
+      const fileChildren: Paragraph[] = row.files.length > 0
+        ? row.files.map((f) => new Paragraph({
+            spacing: { after: 60 },
+            children: [
+              new TextRun({ text: "• ", color: "1E3A5F" }),
+              f.url
+                ? new ExternalHyperlink({
+                    link: f.url,
+                    children: [new TextRun({ text: f.name, color: "2563EB", underline: {} })],
+                  })
+                : new TextRun({ text: f.name, color: "374151" }),
+            ],
+          }))
+        : [new Paragraph({
+            children: [new TextRun({ text: "Nenhum arquivo", italics: true, color: "9CA3AF" })],
+          })];
+
+      return new TableRow({
+        children: [
+          new TableCell({
+            width: { size: col1Width, type: WidthType.DXA },
+            shading: { type: ShadingType.CLEAR, color: "auto", fill: bgColor },
+            margins: { top: 80, bottom: 80, left: 120, right: 120 },
+            verticalAlign: "top" as any,
+            children: [
+              new Paragraph({
+                children: [new TextRun({ text: row.itemLabel || "-", bold: true, color: "1F2937", size: 21 })],
+              }),
+            ],
+          }),
+          new TableCell({
+            width: { size: col2Width, type: WidthType.DXA },
+            shading: { type: ShadingType.CLEAR, color: "auto", fill: bgColor },
+            margins: { top: 80, bottom: 80, left: 120, right: 120 },
+            children: fileChildren,
+          }),
+        ],
+      });
+    });
+
+    return new Table({
+      layout: TableLayoutType.FIXED,
+      width: { size: tableWidth, type: WidthType.DXA },
+      columnWidths: [col1Width, col2Width],
+      borders: {
+        top: { style: BorderStyle.SINGLE, size: 8, color: "CBD5E1" },
+        bottom: { style: BorderStyle.SINGLE, size: 8, color: "CBD5E1" },
+        left: { style: BorderStyle.SINGLE, size: 8, color: "CBD5E1" },
+        right: { style: BorderStyle.SINGLE, size: 8, color: "CBD5E1" },
+        insideHorizontal: { style: BorderStyle.SINGLE, size: 4, color: "E2E8F0" },
+        insideVertical: { style: BorderStyle.SINGLE, size: 4, color: "E2E8F0" },
+      },
+      rows: [headerRow, ...dataRows],
+    });
+  }
+
+  private static buildDocxStyles() {
+    return {
+      default: {
+        document: {
+          run: { font: "Calibri", size: 22, color: "374151" },
+          paragraph: { spacing: { line: 276, after: 120 } },
+        },
+      },
+      paragraphStyles: [
+        {
+          id: "Title",
+          name: "Title",
+          basedOn: "Normal",
+          next: "Normal",
+          run: { size: 44, bold: true, color: "1E3A5F", font: "Calibri Light" },
+          paragraph: { alignment: AlignmentType.CENTER, spacing: { after: 300 } },
+        },
+        {
+          id: "Heading1",
+          name: "Heading 1",
+          basedOn: "Normal",
+          next: "Normal",
+          run: { size: 28, bold: true, color: "1E3A5F" },
+          paragraph: { spacing: { before: 360, after: 160 } },
+        },
+        {
+          id: "Heading2",
+          name: "Heading 2",
+          basedOn: "Normal",
+          next: "Normal",
+          run: { size: 24, bold: true, color: "1E3A5F" },
+          paragraph: { spacing: { before: 280, after: 120 } },
+        },
+        {
+          id: "Heading3",
+          name: "Heading 3",
+          basedOn: "Normal",
+          next: "Normal",
+          run: { size: 22, bold: true, color: "334155" },
+          paragraph: { spacing: { before: 200, after: 80 } },
+        },
+        {
+          id: "Normal",
+          name: "Normal",
+          run: { size: 22, color: "374151" },
+          paragraph: { spacing: { line: 276, after: 120 } },
+        },
+      ],
+      characterStyles: [
+        {
+          id: "Hyperlink",
+          name: "Hyperlink",
+          basedOn: "DefaultParagraphFont",
+          run: { color: "2563EB", underline: {} },
+        },
+      ],
+    } as const;
+  }
+
   private static buildDocxFullWidthTitle(
     text: string,
     alignment: (typeof AlignmentType)[keyof typeof AlignmentType] = AlignmentType.LEFT
   ) {
-    return new Paragraph({
-      text,
-      heading: HeadingLevel.HEADING_1,
-      alignment,
+    // Título com fundo azul escuro para destaque profissional
+    const titleWidth = 9360;
+    return new Table({
+      layout: TableLayoutType.FIXED,
+      width: { size: titleWidth, type: WidthType.DXA },
+      columnWidths: [titleWidth],
+      borders: {
+        top: { style: BorderStyle.NONE, size: 0, color: "FFFFFF" },
+        bottom: { style: BorderStyle.NONE, size: 0, color: "FFFFFF" },
+        left: { style: BorderStyle.NONE, size: 0, color: "FFFFFF" },
+        right: { style: BorderStyle.NONE, size: 0, color: "FFFFFF" },
+      },
+      rows: [
+        new TableRow({
+          children: [
+            new TableCell({
+              width: { size: titleWidth, type: WidthType.DXA },
+              margins: { top: 140, bottom: 140, left: 200, right: 200 },
+              shading: { type: ShadingType.CLEAR, color: "auto", fill: "1E3A5F" },
+              children: [
+                new Paragraph({
+                  alignment,
+                  children: [new TextRun({ text, bold: true, size: 28, color: "FFFFFF" })],
+                }),
+              ],
+            }),
+          ],
+        }),
+      ],
     });
   }
 
@@ -90,10 +474,10 @@ export class ReportService {
       width: { size: cardWidthTwips, type: WidthType.DXA },
       columnWidths: [cardWidthTwips],
       borders: {
-        top: { style: BorderStyle.SINGLE, size: 8, color: "E2E8F0" },
-        bottom: { style: BorderStyle.SINGLE, size: 8, color: "E2E8F0" },
-        left: { style: BorderStyle.SINGLE, size: 8, color: "E2E8F0" },
-        right: { style: BorderStyle.SINGLE, size: 8, color: "E2E8F0" },
+        top: { style: BorderStyle.SINGLE, size: 8, color: "CBD5E1" },
+        bottom: { style: BorderStyle.SINGLE, size: 8, color: "CBD5E1" },
+        left: { style: BorderStyle.SINGLE, size: 8, color: "CBD5E1" },
+        right: { style: BorderStyle.SINGLE, size: 8, color: "CBD5E1" },
         insideHorizontal: { style: BorderStyle.SINGLE, size: 0, color: "FFFFFF" },
         insideVertical: { style: BorderStyle.SINGLE, size: 0, color: "FFFFFF" },
       },
@@ -106,7 +490,7 @@ export class ReportService {
               shading: {
                 type: ShadingType.CLEAR,
                 color: "auto",
-                fill: "FFFFFF",
+                fill: "F8FAFC",
               },
               children,
             }),
@@ -124,6 +508,7 @@ export class ReportService {
           text,
           bold: true,
           size: 24,
+          color: "0F172A",
         }),
       ],
     });
@@ -137,6 +522,7 @@ export class ReportService {
           text,
           bold: true,
           size: 22,
+          color: "0F172A",
         }),
       ],
     });
@@ -145,29 +531,46 @@ export class ReportService {
   private static buildDocxCardSectionTitle(text: string) {
     return new Paragraph({
       spacing: { before: 120, after: 80 },
-      children: [new TextRun({ text, bold: true })],
+      children: [new TextRun({ text, bold: true, color: "0F172A" })],
     });
   }
 
   private static buildCriteriaTableDocx(
-    rows: Array<{ label: string; description: string; labelFill: string }>
+    rows: Array<{ label: string; description: string; labelFill: string }>,
+    headerTitle?: string
   ) {
     const tableWidth = 9360;
     const labelWidth = 2200;
     const descWidth = tableWidth - labelWidth;
-    return new Table({
-      layout: TableLayoutType.FIXED,
-      width: { size: tableWidth, type: WidthType.DXA },
-      columnWidths: [labelWidth, descWidth],
-      borders: {
-        top: { style: BorderStyle.SINGLE, size: 8, color: "E2E8F0" },
-        bottom: { style: BorderStyle.SINGLE, size: 8, color: "E2E8F0" },
-        left: { style: BorderStyle.SINGLE, size: 8, color: "E2E8F0" },
-        right: { style: BorderStyle.SINGLE, size: 8, color: "E2E8F0" },
-        insideHorizontal: { style: BorderStyle.SINGLE, size: 8, color: "E2E8F0" },
-        insideVertical: { style: BorderStyle.SINGLE, size: 8, color: "E2E8F0" },
-      },
-      rows: rows.map((row) =>
+
+    const tableRows: TableRow[] = [];
+
+    // Header row que cobre toda a tabela (se fornecido)
+    if (headerTitle) {
+      tableRows.push(
+        new TableRow({
+          tableHeader: true,
+          children: [
+            new TableCell({
+              width: { size: tableWidth, type: WidthType.DXA },
+              columnSpan: 2,
+              margins: { top: 120, bottom: 120, left: 160, right: 160 },
+              shading: { type: ShadingType.CLEAR, color: "auto", fill: "1E3A5F" },
+              children: [
+                new Paragraph({
+                  alignment: AlignmentType.CENTER,
+                  children: [new TextRun({ text: headerTitle, bold: true, color: "FFFFFF", size: 24 })],
+                }),
+              ],
+            }),
+          ],
+        })
+      );
+    }
+
+    // Data rows
+    rows.forEach((row) => {
+      tableRows.push(
         new TableRow({
           children: [
             new TableCell({
@@ -196,54 +599,75 @@ export class ReportService {
             }),
           ],
         })
-      ),
+      );
+    });
+
+    return new Table({
+      layout: TableLayoutType.FIXED,
+      width: { size: tableWidth, type: WidthType.DXA },
+      columnWidths: [labelWidth, descWidth],
+      borders: {
+        top: { style: BorderStyle.SINGLE, size: 8, color: "CBD5E1" },
+        bottom: { style: BorderStyle.SINGLE, size: 8, color: "CBD5E1" },
+        left: { style: BorderStyle.SINGLE, size: 8, color: "CBD5E1" },
+        right: { style: BorderStyle.SINGLE, size: 8, color: "CBD5E1" },
+        insideHorizontal: { style: BorderStyle.SINGLE, size: 8, color: "E2E8F0" },
+        insideVertical: { style: BorderStyle.SINGLE, size: 8, color: "E2E8F0" },
+      },
+      rows: tableRows,
     });
   }
 
   private static buildCriticidadeTableDocx() {
-    return ReportService.buildCriteriaTableDocx([
-      {
-        label: "ALTA",
-        description:
-          "Quando a deficiência comprometer de maneira significativa a efetividade do controle de PLD/FTP associado.",
-        labelFill: "#FEE2E2",
-      },
-      {
-        label: "MÉDIA",
-        description:
-          "Quando a deficiência corresponder a inobservância de boa prática de PLD/FTP ou quando a deficiência comprometer parcialmente a efetividade do controle de PLD/FTP associado.",
-        labelFill: "#FEF9C3",
-      },
-      {
-        label: "BAIXA",
-        description:
-          "Quando a deficiência não compromete a efetividade do controle de PLD/FTP associado.",
-        labelFill: "#DCFCE7",
-      },
-    ]);
+    return ReportService.buildCriteriaTableDocx(
+      [
+        {
+          label: "ALTA",
+          description:
+            "Quando a deficiência comprometer de maneira significativa a efetividade do controle de PLD/FTP associado.",
+          labelFill: "#FEE2E2",
+        },
+        {
+          label: "MÉDIA",
+          description:
+            "Quando a deficiência corresponder a inobservância de boa prática de PLD/FTP ou quando a deficiência comprometer parcialmente a efetividade do controle de PLD/FTP associado.",
+          labelFill: "#FEF9C3",
+        },
+        {
+          label: "BAIXA",
+          description:
+            "Quando a deficiência não compromete a efetividade do controle de PLD/FTP associado.",
+          labelFill: "#DCFCE7",
+        },
+      ],
+      "GRAU DE CRITICIDADE"
+    );
   }
 
   private static buildEfetividadeTableDocx() {
-    return ReportService.buildCriteriaTableDocx([
-      {
-        label: "EFETIVO",
-        description:
-          "Quando o programa de PLD/FTP atingir a maioria dos resultados esperados, sem a identificação de deficiências de alta criticidade nos procedimentos de monitoramento, seleção, análise e comunicação de operações atípicas, nos procedimentos de verificação de sanções CSNU, e nos procedimentos conheça seu cliente.",
-        labelFill: "#DCFCE7",
-      },
-      {
-        label: "PARCIALMENTE EFETIVO",
-        description:
-          "Quando o programa de PLD/FTP atingir a maioria dos resultados esperados, com a identificação de algumas deficiências de alta criticidade nos procedimentos conheça seu cliente ou nos procedimentos de monitoramento, seleção, análise e comunicação de operações atípicas.",
-        labelFill: "#FEF9C3",
-      },
-      {
-        label: "POUCO EFETIVO",
-        description:
-          "Quando o programa de PLD/FTP não atingir a maioria dos resultados esperados, com a identificação de deficiências de alta criticidade nos procedimentos de monitoramento, seleção, análise e comunicação de operações atípicas, nos procedimentos de verificação de sanções CSNU, e nos procedimentos conheça seu cliente.",
-        labelFill: "#FEE2E2",
-      },
-    ]);
+    return ReportService.buildCriteriaTableDocx(
+      [
+        {
+          label: "EFETIVO",
+          description:
+            "Quando o programa de PLD/FTP atingir a maioria dos resultados esperados, sem a identificação de deficiências de alta criticidade nos procedimentos de monitoramento, seleção, análise e comunicação de operações atípicas, nos procedimentos de verificação de sanções CSNU, e nos procedimentos conheça seu cliente.",
+          labelFill: "#DCFCE7",
+        },
+        {
+          label: "PARCIALMENTE EFETIVO",
+          description:
+            "Quando o programa de PLD/FTP atingir a maioria dos resultados esperados, com a identificação de algumas deficiências de alta criticidade nos procedimentos conheça seu cliente ou nos procedimentos de monitoramento, seleção, análise e comunicação de operações atípicas.",
+          labelFill: "#FEF9C3",
+        },
+        {
+          label: "POUCO EFETIVO",
+          description:
+            "Quando o programa de PLD/FTP não atingir a maioria dos resultados esperados, com a identificação de deficiências de alta criticidade nos procedimentos de monitoramento, seleção, análise e comunicação de operações atípicas, nos procedimentos de verificação de sanções CSNU, e nos procedimentos conheça seu cliente.",
+          labelFill: "#FEE2E2",
+        },
+      ],
+      "CRITÉRIOS DE AVALIAÇÃO DE EFETIVIDADE"
+    );
   }
 
   private static buildConclusaoRows(sections: any[]) {
@@ -253,7 +677,19 @@ export class ReportService {
         : section?.item || "-";
       const counts = { baixa: 0, media: 0, alta: 0 };
       (section?.questions || []).forEach((question: any) => {
-        if (!question?.deficienciaTexto) return;
+        if (question?.aplicavel === false) return;
+        
+        // IMPORTANTE: Só conta se a resposta for "Não" (indica deficiência)
+        const resposta = (question?.resposta || "").toString().trim();
+        const respostaNormalized = resposta
+          .toLowerCase()
+          .normalize("NFD")
+          .replace(/[\u0300-\u036f]/g, "");
+        const isRespostaNao = respostaNormalized === "nao" || respostaNormalized === "n";
+        
+        // Se não for resposta "Não", não conta como deficiência
+        if (!isRespostaNao) return;
+        
         const crit = String(question?.criticidade || "").toUpperCase();
         if (crit === "BAIXA") counts.baixa += 1;
         else if (crit === "MEDIA" || crit === "MÉDIA") counts.media += 1;
@@ -457,6 +893,7 @@ export class ReportService {
 
     const requesterRole = (requester.requesterRole || requesterUser.role || "").toUpperCase();
     const requesterEmail = (requester.requesterEmail || requesterUser.email || "").toLowerCase();
+    const isAdminReport = requesterRole === "ADMIN" || requesterRole === "TRIAL_ADMIN";
 
     // Permissões:
     // - ADMIN pode gerar
@@ -487,20 +924,28 @@ export class ReportService {
 
     const sections: any[] = Array.isArray(payload.sections) ? payload.sections : [];
     const metadata: any = payload.metadata || null;
-    const helpTexts: any = payload.helpTexts || null;
 
     const introInstituicoes = Array.isArray(metadata?.instituicoes)
       ? metadata.instituicoes
       : [];
+    const introInstituicoesInline = introInstituicoes.length
+      ? introInstituicoes
+          .map((inst: any) =>
+            `${((inst?.nome || "-") + "").trim()}${inst?.cnpj ? ` (CNPJ: ${inst.cnpj})` : ""}`
+          )
+          .join(", ")
+      : "-";
     const introAvaliador = (metadata?.qualificacaoAvaliador || "").toString().trim();
-    const mostrarMetodologia = (metadata?.mostrarMetodologia || "MOSTRAR").toString();
     const incluirRecomendacoes = (metadata?.incluirRecomendacoes || "INCLUIR").toString();
+    const mostrarMetodologia = (metadata?.mostrarMetodologia || "MOSTRAR").toString().toUpperCase();
     const deficiencias = ReportService.collectDeficiencias(sections);
+    const sectionLabels = ReportService.getSectionLabels(sections);
 
     const baseUrl = (process.env.PUBLIC_BASE_URL || "http://localhost:3001")
       .replace(/\/api\/?$/, "")
       .replace(/\/+$/, "");
     const generatedAt = new Date().toLocaleString("pt-BR");
+    const formCreatedAtText = ReportService.formatDatePtBr(new Date());
     const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
     const reportsDir = getReportsDir();
 
@@ -533,70 +978,111 @@ export class ReportService {
               text: `Gerado por: ${requesterUser.name} <${requesterUser.email}>`,
               break: 1,
             }),
-            new TextRun({ text: `Formulário: ${formName}`, break: 1 }),
-            new TextRun({
-              text: reportForm.assignedToEmail
-                ? `Atribuído a: ${reportForm.assignedToEmail}`
-                : "",
-              break: reportForm.assignedToEmail ? 1 : 0,
-            }),
             new TextRun({ text: `Data: ${generatedAt}`, break: 1 }),
           ].filter(Boolean) as any,
         }),
         ReportService.buildDocxFullWidthTitle("1- Introdução"),
-        ...(introInstituicoes.length
-          ? [
-              new Paragraph({
-                spacing: { after: 120 },
-                children: [new TextRun({ text: "Instituição(ões)", bold: true })],
-              }),
-              ...introInstituicoes.map((inst: any) =>
-                new Paragraph({
-                  bullet: { level: 0 },
-                  children: [
-                    new TextRun({
-                      text: `${((inst?.nome || "-") + "").trim()}${inst?.cnpj ? ` (CNPJ: ${inst.cnpj})` : ""}`,
-                    }),
-                  ],
-                })
-              ),
-            ]
-          : [
-              new Paragraph({
-                spacing: { after: 120 },
-                children: [new TextRun({ text: "Instituição(ões): -", bold: true })],
-              }),
-            ]),
         new Paragraph({
-          spacing: { before: 120, after: 120 },
-          children: [new TextRun({ text: "Descrição do avaliador", bold: true })],
+          text:
+            "Conforme artigo 62 da Circular BCB nº 3.978, de 23 de janeiro de 2020, as instituições autorizadas a funcionar pelo Banco Central do Brasil devem avaliar anualmente a efetividade da política, dos procedimentos e dos controles internos por elas implementados para a prevenção à lavagem de dinheiro e ao financiamento do terrorismo.",
+          spacing: { after: 160 },
         }),
+        new Paragraph({
+          text: `Este relatório contém o resultado da avaliação dos diversos itens do programa de PLD/FTP das instituições ${introInstituicoesInline}.`,
+          spacing: { after: 160 },
+        }),
+        new Paragraph({
+          text:
+            "Para fins de elaboração deste relatório, Instituição será doravante adotado para designar ambas as instituições.",
+          spacing: { after: 160 },
+        }),
+        new Paragraph({
+          text:
+            "Em atendimento ao disposto no § 1º do artigo 62 da Circular BCB nº 3.978/20, este relatório descreve a metodologia empregada nessa avaliação, os testes aplicados, a qualificação do avaliador, os itens avaliados e o resultado dessa avaliação (deficiências identificadas).",
+          spacing: { after: 160 },
+        }),
+        new Paragraph({
+          text: `A avaliação considerou o programa de PLD/FTP vigente em ${formCreatedAtText}.`,
+          spacing: { after: 160 },
+        }),
+        ReportService.buildDocxFullWidthTitle("2- Metodologia de Avaliação"),
+        new Paragraph({
+          text: "A metodologia de avaliação consistiu na:",
+          spacing: { after: 120 },
+        }),
+        ...[
+          "verificação da existência, formalização, conteúdo, atualização e, quando for o caso, a divulgação dos documentos exigidos expressamente na Circular BCB nº 3.978/20:",
+        ].map((item) =>
+          new Paragraph({
+            bullet: { level: 0 },
+            text: item,
+          })
+        ),
+        ...[
+          "Política de PLD/FTP;",
+          "Manual de Procedimentos Conheça seu Cliente;",
+          "Manual de Procedimentos de Monitoramento, Seleção, Análise e Comunicação de Operações Suspeitas (Procedimentos MSAC);",
+          "Procedimentos Conheça seu Funcionário;",
+          "Procedimentos Conheça seu Parceiro;",
+          "Procedimentos Conheça seu Prestador de Serviço Terceirizado;",
+          "Relatório de Avaliação Interna de Risco",
+          "Relatório de Avaliação de Efetividade do ano anterior;",
+          "Plano de Ação para correção das deficiências identificadas no Relatório de Avaliação de Efetividade do ano anterior;",
+          "Relatório de Acompanhamento do Plano de Ação;",
+        ].map((item) =>
+          new Paragraph({
+            bullet: { level: 1 },
+            text: item,
+          })
+        ),
+        ...[
+          "avaliação da estrutura e dos procedimentos de governança de PLD/FTP;",
+          "avaliação do programa de treinamento em PLD/FTP e das ações de promoção da cultura organizacional de PLD/FTP;",
+          "avaliação dos procedimentos MSAC, incluindo a adequação da área de PLD/FTP;",
+          "avaliação dos procedimentos relacionados ao cumprimento das disposições da Lei nº 13.810/19, regulamentados pela Resolução BCB nº 44/20 e Instrução Normativa BCB nº 262/22;",
+          "avaliação dos procedimentos antifraude;",
+          "avaliação dos mecanismos de acompanhamento e de controle de que trata o Capítulo X da Circular BCB nº 3.978/20, incluindo auditoria interna;",
+          "realização de testes com o propósito de verificar a aderência dos procedimentos vigentes em relação ao disposto nos documentos internos, por meio de: entrevistas; requisição de evidências; amostragem; acompanhamento, por meio de reuniões remotas, da execução dos procedimentos e controles de PLD/FTP pelos responsáveis diretos por tal execução; e na análise de relatórios gerenciais e de estatísticas relativas ao sistema de monitoramento e aos procedimentos conheça seu cliente.",
+        ].map((item) =>
+          new Paragraph({
+            bullet: { level: 0 },
+            text: item,
+          })
+        ),
+        new Paragraph({
+          text: "Os itens avaliados do programa de PLD/FTP da Instituição foram:",
+          spacing: { before: 120, after: 80 },
+        }),
+        ...(sectionLabels.length > 0
+          ? sectionLabels.map((label, idx) =>
+              new Paragraph({
+                bullet: { level: 0 },
+                text: `${idx + 1}. ${label}`,
+              })
+            )
+          : [new Paragraph({ text: "-" })]),
+        new Paragraph({
+          text:
+            "A descrição detalhada da avaliação de cada item, incluindo os testes realizados, consta no item EXECUÇÃO.",
+          spacing: { before: 160, after: 120 },
+        }),
+        new Paragraph({
+          text:
+            "Como resultado dessa avaliação, a deficiência identificada recebeu um grau de criticidade definido conforme tabela abaixo.",
+          spacing: { after: 120 },
+        }),
+        ReportService.buildCriticidadeTableDocx(),
+        new Paragraph({
+          text:
+            "O resultado da avaliação de efetividade resultará na atribuição de um dos conceitos, mostrados a seguir, ao programa de PLD/FTP da Instituição.",
+          spacing: { before: 200, after: 160 },
+        }),
+        ReportService.buildEfetividadeTableDocx(),
+        new Paragraph({ text: "", spacing: { after: 400 } }),
+        ReportService.buildDocxFullWidthTitle("3- Qualificação do Avaliador"),
         new Paragraph({ text: introAvaliador || "-", spacing: { after: 160 } }),
-        ReportService.buildDocxFullWidthTitle("2- Configurações"),
-        ReportService.buildDocxCard([
-          ReportService.buildLabelValueParagraph(
-            "Metodologia - Resultado da Avaliação",
-            mostrarMetodologia === "MOSTRAR" ? "MOSTRAR" : "NÃO MOSTRAR"
-          ),
-          ReportService.buildLabelValueParagraph(
-            "Recomendações",
-            incluirRecomendacoes === "INCLUIR" ? "INCLUIR" : "NÃO INCLUIR",
-            { spacingAfter: 0 }
-          ),
-        ]),
-        new Paragraph({ text: "", spacing: { after: 200 } }),
+        ReportService.buildDocxFullWidthTitle("4- Execução"),
       ];
-
-      if (mostrarMetodologia === "MOSTRAR") {
-        children.push(
-          ReportService.buildDocxFullWidthTitle("3- Metodologia - Resultado da Avaliação")
-        );
-        const metodologiaTexto =
-          typeof helpTexts?.metodologia === "string" ? helpTexts.metodologia.trim() : "";
-        children.push(new Paragraph({ text: metodologiaTexto || "-", spacing: { after: 200 } }));
-      }
-
-      children.push(ReportService.buildDocxFullWidthTitle("4- Execução"));
 
       sections.forEach((section: any, sectionIndex: number) => {
         const sectionLabel = (section?.customLabel || "").trim()
@@ -606,13 +1092,15 @@ export class ReportService {
         children.push(
           ReportService.buildExecutionItemTitleDocx(`${itemPrefix} ${sectionLabel || "-"}`)
         );
-        children.push(
-          ReportService.buildLabelValueParagraph(
-            "Descrição do item avaliado",
-            section?.descricao ? String(section.descricao) : "-",
-            { spacingAfter: 160 }
-          )
-        );
+        if (isAdminReport) {
+          children.push(
+            ReportService.buildLabelValueParagraph(
+              "Descrição do item avaliado",
+              section?.descricao ? String(section.descricao) : "-",
+              { spacingAfter: 160 }
+            )
+          );
+        }
 
         const sectionDeficiencias = deficiencias.filter(
           (def) => def.sectionLabel === (sectionLabel || "-")
@@ -628,20 +1116,8 @@ export class ReportService {
                     question?.testDescription ? String(question.testDescription) : "-"
                   ),
                   ReportService.buildLabelValueParagraph(
-                    "Referência (requisição)",
-                    question?.requisicaoRef ? String(question.requisicaoRef) : "-"
-                  ),
-                  ReportService.buildLabelValueParagraph(
-                    "Referência (resposta)",
+                    "Resposta do Teste",
                     question?.respostaTesteRef ? String(question.respostaTesteRef) : "-"
-                  ),
-                  ReportService.buildLabelValueParagraph(
-                    "Referência (amostra)",
-                    question?.amostraRef ? String(question.amostraRef) : "-"
-                  ),
-                  ReportService.buildLabelValueParagraph(
-                    "Referência (evidências)",
-                    question?.evidenciasRef ? String(question.evidenciasRef) : "-"
                   ),
                 ]
               : []),
@@ -656,6 +1132,7 @@ export class ReportService {
               }, new Map<string, any>())
               .values()
           );
+          // Todos os grupos de arquivos
           const attachmentGroups = [
             {
               label: "Requisição",
@@ -754,7 +1231,52 @@ export class ReportService {
       );
       children.push(ReportService.buildConclusaoTableDocx(conclusaoRows));
 
+      // Resultado da Avaliação (user form DOCX) - renderizado apenas se mostrarMetodologia === 'MOSTRAR'
+      if (mostrarMetodologia === "MOSTRAR") {
+        const resultadoAvaliacao = ReportService.calcularResultadoAvaliacao(sections);
+        children.push(
+          new Paragraph({
+            text: "Resultado da Avaliação",
+            heading: HeadingLevel.HEADING_2,
+            spacing: { before: 240, after: 120 },
+          })
+        );
+        children.push(
+          new Paragraph({
+            children: [
+              new TextRun({ text: "Resultado: ", bold: true }),
+              new TextRun({ text: resultadoAvaliacao.resultado }),
+            ],
+            spacing: { after: 80 },
+          })
+        );
+        children.push(
+          new Paragraph({
+            text: resultadoAvaliacao.descricao,
+            spacing: { after: 200 },
+          })
+        );
+      } else {
+        children.push(new Paragraph({ text: "", spacing: { after: 200 } }));
+      }
+
+      const evidenceRows = ReportService.buildEvidenceAnnexRows(sections, "4", baseUrl);
+      children.push(ReportService.buildDocxFullWidthTitle("6- ANEXO EVIDÊNCIAS"));
+      children.push(
+        new Paragraph({
+          text:
+            "A tabela abaixo apresenta os itens avaliados e todos os arquivos enviados (norma e demais anexos) relacionados às questões.",
+          spacing: { after: 120 },
+        })
+      );
+      if (evidenceRows.length > 0) {
+        children.push(ReportService.buildEvidenceAnnexTableDocx(evidenceRows));
+      } else {
+        children.push(new Paragraph({ text: "-", spacing: { after: 120 } }));
+      }
+
       const doc = new Document({
+        styles: ReportService.buildDocxStyles(),
         sections: [
           {
             properties: {},
@@ -948,6 +1470,19 @@ export class ReportService {
       pdf.moveDown(0.2);
     };
 
+    const bulletItemSecondary = (text: string) => {
+      ensureSpace(18);
+      pdf
+        .fillColor(textMuted)
+        .font("Helvetica")
+        .fontSize(10.5)
+        .text(`- ${text}`, marginLeft + 24, pdf.y, {
+          width: contentWidth - 24,
+          lineGap: 2,
+        });
+      pdf.moveDown(0.2);
+    };
+
     const drawCriteriaTable = (
       rows: Array<{ label: string; description: string; labelFill: string }>
     ) => {
@@ -1023,47 +1558,116 @@ export class ReportService {
       .text(`Gerado por: ${requesterUser.name} <${requesterUser.email}>`, {
         align: "center",
       });
-    pdf.text(`Formulário: ${formName}`, { align: "center" });
-    if (reportForm.assignedToEmail) {
-      pdf.text(`Atribuído a: ${reportForm.assignedToEmail}`, { align: "center" });
-    }
     pdf.text(`Data: ${generatedAt}`, { align: "center" });
     pdf.moveDown(1.0);
     hr();
 
     titleBlock("1- Introdução");
-    if (introInstituicoes.length > 0) {
-      h3("Instituição(ões)");
-      introInstituicoes.forEach((inst: any, idx: number) => {
-        const nome = ((inst?.nome || "-") + "").trim() || "-";
-        const cnpj = ((inst?.cnpj || "") + "").trim();
-        p(`${idx + 1}. ${nome}${cnpj ? ` (CNPJ: ${cnpj})` : ""}`);
+    p(
+      "Conforme artigo 62 da Circular BCB nº 3.978, de 23 de janeiro de 2020, as instituições autorizadas a funcionar pelo Banco Central do Brasil devem avaliar anualmente a efetividade da política, dos procedimentos e dos controles internos por elas implementados para a prevenção à lavagem de dinheiro e ao financiamento do terrorismo."
+    );
+    p(
+      `Este relatório contém o resultado da avaliação dos diversos itens do programa de PLD/FTP das instituições ${introInstituicoesInline}.`
+    );
+    p(
+      "Para fins de elaboração deste relatório, Instituição será doravante adotado para designar ambas as instituições."
+    );
+    p(
+      "Em atendimento ao disposto no § 1º do artigo 62 da Circular BCB nº 3.978/20, este relatório descreve a metodologia empregada nessa avaliação, os testes aplicados, a qualificação do avaliador, os itens avaliados e o resultado dessa avaliação (deficiências identificadas)."
+    );
+    p(`A avaliação considerou o programa de PLD/FTP vigente em ${formCreatedAtText}.`);
+    hr();
+
+    titleBlock("2- Metodologia de Avaliação");
+    p("A metodologia de avaliação consistiu na:");
+    [
+      "verificação da existência, formalização, conteúdo, atualização e, quando for o caso, a divulgação dos documentos exigidos expressamente na Circular BCB nº 3.978/20:",
+    ].forEach(bulletItem);
+    [
+      "Política de PLD/FTP;",
+      "Manual de Procedimentos Conheça seu Cliente;",
+      "Manual de Procedimentos de Monitoramento, Seleção, Análise e Comunicação de Operações Suspeitas (Procedimentos MSAC);",
+      "Procedimentos Conheça seu Funcionário;",
+      "Procedimentos Conheça seu Parceiro;",
+      "Procedimentos Conheça seu Prestador de Serviço Terceirizado;",
+      "Relatório de Avaliação Interna de Risco",
+      "Relatório de Avaliação de Efetividade do ano anterior;",
+      "Plano de Ação para correção das deficiências identificadas no Relatório de Avaliação de Efetividade do ano anterior;",
+      "Relatório de Acompanhamento do Plano de Ação;",
+    ].forEach(bulletItemSecondary);
+    [
+      "avaliação da estrutura e dos procedimentos de governança de PLD/FTP;",
+      "avaliação do programa de treinamento em PLD/FTP e das ações de promoção da cultura organizacional de PLD/FTP;",
+      "avaliação dos procedimentos MSAC, incluindo a adequação da área de PLD/FTP;",
+      "avaliação dos procedimentos relacionados ao cumprimento das disposições da Lei nº 13.810/19, regulamentados pela Resolução BCB nº 44/20 e Instrução Normativa BCB nº 262/22;",
+      "avaliação dos procedimentos antifraude;",
+      "avaliação dos mecanismos de acompanhamento e de controle de que trata o Capítulo X da Circular BCB nº 3.978/20, incluindo auditoria interna;",
+      "realização de testes com o propósito de verificar a aderência dos procedimentos vigentes em relação ao disposto nos documentos internos, por meio de: entrevistas; requisição de evidências; amostragem; acompanhamento, por meio de reuniões remotas, da execução dos procedimentos e controles de PLD/FTP pelos responsáveis diretos por tal execução; e na análise de relatórios gerenciais e de estatísticas relativas ao sistema de monitoramento e aos procedimentos conheça seu cliente.",
+    ].forEach(bulletItem);
+    p("Os itens avaliados do programa de PLD/FTP da Instituição foram:");
+    if (sectionLabels.length > 0) {
+      sectionLabels.forEach((label, idx) => {
+        bulletItem(`${idx + 1}. ${label}`);
       });
     } else {
-      p("Instituição(ões): -");
+      p("-");
     }
-    h3("Descrição do avaliador");
+    p(
+      "A descrição detalhada da avaliação de cada item, incluindo os testes realizados, consta no item EXECUÇÃO."
+    );
+    p(
+      "Como resultado dessa avaliação, a deficiência identificada recebeu um grau de criticidade definido conforme tabela abaixo."
+    );
+    titleBlock("GRAU DE CRITICIDADE", "center");
+    drawCriteriaTable([
+      {
+        label: "ALTA",
+        description:
+          "Quando a deficiência comprometer de maneira significativa a efetividade do controle de PLD/FTP associado.",
+        labelFill: "#FEE2E2",
+      },
+      {
+        label: "MÉDIA",
+        description:
+          "Quando a deficiência corresponder a inobservância de boa prática de PLD/FTP ou quando a deficiência comprometer parcialmente a efetividade do controle de PLD/FTP associado.",
+        labelFill: "#FEF9C3",
+      },
+      {
+        label: "BAIXA",
+        description:
+          "Quando a deficiência não compromete a efetividade do controle de PLD/FTP associado.",
+        labelFill: "#DCFCE7",
+      },
+    ]);
+    p(
+      "O resultado da avaliação de efetividade resultará na atribuição de um dos conceitos, mostrados a seguir, ao programa de PLD/FTP da Instituição."
+    );
+    titleBlock("CRITÉRIOS DE AVALIAÇÃO DE EFETIVIDADE", "center");
+    drawCriteriaTable([
+      {
+        label: "EFETIVO",
+        description:
+          "Quando o programa de PLD/FTP atingir a maioria dos resultados esperados, sem a identificação de deficiências de alta criticidade nos procedimentos de monitoramento, seleção, análise e comunicação de operações atípicas, nos procedimentos de verificação de sanções CSNU, e nos procedimentos conheça seu cliente.",
+        labelFill: "#DCFCE7",
+      },
+      {
+        label: "PARCIALMENTE EFETIVO",
+        description:
+          "Quando o programa de PLD/FTP atingir a maioria dos resultados esperados, com a identificação de algumas deficiências de alta criticidade nos procedimentos conheça seu cliente ou nos procedimentos de monitoramento, seleção, análise e comunicação de operações atípicas.",
+        labelFill: "#FEF9C3",
+      },
+      {
+        label: "POUCO EFETIVO",
+        description:
+          "Quando o programa de PLD/FTP não atingir a maioria dos resultados esperados, com a identificação de deficiências de alta criticidade nos procedimentos de monitoramento, seleção, análise e comunicação de operações atípicas, nos procedimentos de verificação de sanções CSNU, e nos procedimentos conheça seu cliente.",
+        labelFill: "#FEE2E2",
+      },
+    ]);
+    hr();
+
+    titleBlock("3- Qualificação do Avaliador");
     p(introAvaliador || "-");
     hr();
-
-    titleBlock("2- Configurações");
-    kv(
-      "Metodologia - Resultado da Avaliação",
-      mostrarMetodologia === "MOSTRAR" ? "MOSTRAR" : "NÃO MOSTRAR"
-    );
-    kv(
-      "Recomendações",
-      incluirRecomendacoes === "INCLUIR" ? "INCLUIR" : "NÃO INCLUIR"
-    );
-    hr();
-
-    if (mostrarMetodologia === "MOSTRAR") {
-      titleBlock("3- Metodologia - Resultado da Avaliação");
-      const metodologiaTexto =
-        typeof helpTexts?.metodologia === "string" ? helpTexts.metodologia.trim() : "";
-      p(metodologiaTexto || "-");
-      hr();
-    }
 
     titleBlock("4- Execução");
 
@@ -1078,11 +1682,13 @@ export class ReportService {
       const itemPrefix = `4.${sectionIndex + 1}`;
       h2Item(`${itemPrefix} ${sectionLabel || "-"}`);
 
-      kv(
-        "Descrição do item avaliado",
-        section?.descricao ? String(section.descricao) : "-"
-      );
-      pdf.moveDown(0.4);
+      if (isAdminReport) {
+        kv(
+          "Descrição do item avaliado",
+          section?.descricao ? String(section.descricao) : "-"
+        );
+        pdf.moveDown(0.4);
+      }
 
       const sectionDeficiencias = deficiencias.filter(
         (def) => def.sectionLabel === (sectionLabel || "-")
@@ -1422,7 +2028,144 @@ export class ReportService {
       });
     };
 
+    const drawEvidenceAnnexTable = (
+      rows: Array<{ itemLabel: string; files: Array<{ name: string; url: string }> }>
+    ) => {
+      const labelWidth = 220;
+      const filesWidth = contentWidth - labelWidth;
+      const paddingX = 6;
+      const paddingY = 6;
+      const fillHeader = "#F1F5F9";
+      const borderColor = "#94A3B8";
+
+      const drawRow = (
+        label: string,
+        files: Array<{ name: string; url: string }>,
+        isHeader: boolean
+      ) => {
+        const filesText = isHeader
+          ? (files[0]?.name || "")
+          : files.length
+            ? files.map((f) => `• ${f.name}`).join("\n")
+            : "-";
+        const rowHeight = Math.max(
+          measureTextHeight(label, {
+            width: labelWidth - paddingX * 2,
+            font: isHeader ? "Helvetica-Bold" : "Helvetica",
+            fontSize: 10,
+            lineGap: 1,
+          }),
+          measureTextHeight(filesText, {
+            width: filesWidth - paddingX * 2,
+            font: isHeader ? "Helvetica-Bold" : "Helvetica",
+            fontSize: 10,
+            lineGap: 2,
+          })
+        ) + paddingY * 2;
+
+        ensureSpace(rowHeight + 4);
+        const startY = pdf.y;
+
+        pdf.save();
+        pdf
+          .fillColor(isHeader ? fillHeader : "#FFFFFF")
+          .rect(marginLeft, startY, labelWidth, rowHeight)
+          .fill();
+        pdf
+          .fillColor(isHeader ? fillHeader : "#FFFFFF")
+          .rect(marginLeft + labelWidth, startY, filesWidth, rowHeight)
+          .fill();
+        pdf.restore();
+
+        pdf
+          .strokeColor(borderColor)
+          .rect(marginLeft, startY, contentWidth, rowHeight)
+          .stroke();
+        pdf
+          .strokeColor(borderColor)
+          .moveTo(marginLeft + labelWidth, startY)
+          .lineTo(marginLeft + labelWidth, startY + rowHeight)
+          .stroke();
+
+        pdf
+          .fillColor(textDark)
+          .font(isHeader ? "Helvetica-Bold" : "Helvetica")
+          .fontSize(10)
+          .text(label, marginLeft + paddingX, startY + paddingY, {
+            width: labelWidth - paddingX * 2,
+            lineGap: 1,
+          });
+        if (isHeader) {
+          pdf
+            .fillColor(textDark)
+            .font("Helvetica-Bold")
+            .fontSize(10)
+            .text(filesText, marginLeft + labelWidth + paddingX, startY + paddingY, {
+              width: filesWidth - paddingX * 2,
+              lineGap: 2,
+            });
+        } else if (files.length === 0) {
+          pdf
+            .fillColor(textDark)
+            .font("Helvetica")
+            .fontSize(10)
+            .text("-", marginLeft + labelWidth + paddingX, startY + paddingY, {
+              width: filesWidth - paddingX * 2,
+              lineGap: 2,
+            });
+        } else {
+          let cursorY = startY + paddingY;
+          files.forEach((file) => {
+            pdf
+              .fillColor(linkColor)
+              .font("Helvetica")
+              .fontSize(10)
+              .text(`• ${file.name}`, marginLeft + labelWidth + paddingX, cursorY, {
+                width: filesWidth - paddingX * 2,
+                lineGap: 2,
+                link: file.url || undefined,
+                underline: true,
+              });
+            cursorY = pdf.y;
+          });
+        }
+
+        pdf.y = startY + rowHeight;
+      };
+
+      drawRow("Item avaliado", [{ name: "Arquivos", url: "" }], true);
+      rows.forEach((row) => drawRow(row.itemLabel, row.files, false));
+    };
+
     drawConclusaoTable(conclusaoRows);
+
+    // Resultado da Avaliação (user form PDF) - renderizado apenas se mostrarMetodologia === 'MOSTRAR'
+    if (mostrarMetodologia === "MOSTRAR") {
+      const resultadoAvaliacao = ReportService.calcularResultadoAvaliacao(sections);
+      pdf.moveDown(0.6);
+      h3("Resultado da Avaliação");
+      pdf
+        .fillColor(textDark)
+        .font("Helvetica-Bold")
+        .fontSize(10)
+        .text("Resultado: ", marginLeft, pdf.y, { continued: true })
+        .font("Helvetica")
+        .text(resultadoAvaliacao.resultado, { lineGap: 2 });
+      pdf.moveDown(0.3);
+      p(resultadoAvaliacao.descricao);
+    }
+
+    const evidenceRows = ReportService.buildEvidenceAnnexRows(sections, "4", baseUrl);
+    pdf.moveDown(0.8);
+    titleBlock("6- ANEXO EVIDÊNCIAS");
+    p(
+      "A tabela abaixo apresenta os itens avaliados e todos os arquivos enviados (norma e demais anexos) relacionados às questões."
+    );
+    if (evidenceRows.length > 0) {
+      drawEvidenceAnnexTable(evidenceRows);
+    } else {
+      p("-");
+    }
 
     pdf.end();
     await new Promise<void>((resolve, reject) => {
@@ -1462,6 +2205,7 @@ export class ReportService {
         instituicoes?: Array<{ nome?: string; cnpj?: string }>
         qualificacaoAvaliador?: string
         incluirRecomendacoes?: string
+        mostrarMetodologia?: string
       } | null
     }
   ) {
@@ -1502,6 +2246,8 @@ export class ReportService {
     const introAvaliador = (opts?.metadata?.qualificacaoAvaliador || "").trim();
     const incluirRecomendacoes =
       String(opts?.metadata?.incluirRecomendacoes || "INCLUIR").toUpperCase();
+    const mostrarMetodologia =
+      String(opts?.metadata?.mostrarMetodologia || "MOSTRAR").toUpperCase();
     const introInstituicoesInline = introInstituicoes.length
       ? introInstituicoes
           .map((inst) =>
@@ -1626,18 +2372,14 @@ export class ReportService {
             "Como resultado dessa avaliação, a deficiência identificada recebeu um grau de criticidade definido conforme tabela abaixo.",
           spacing: { after: 120 },
         }),
-        ReportService.buildDocxFullWidthTitle("GRAU DE CRITICIDADE", AlignmentType.CENTER),
         ReportService.buildCriticidadeTableDocx(),
         new Paragraph({
           text:
             "O resultado da avaliação de efetividade resultará na atribuição de um dos conceitos, mostrados a seguir, ao programa de PLD/FTP da Instituição.",
-          spacing: { before: 160, after: 120 },
+          spacing: { before: 200, after: 160 },
         }),
-        ReportService.buildDocxFullWidthTitle(
-          "CRITÉRIOS DE AVALIAÇÃO DE EFETIVIDADE",
-          AlignmentType.CENTER
-        ),
         ReportService.buildEfetividadeTableDocx(),
+        new Paragraph({ text: "", spacing: { after: 400 } }),
         ReportService.buildDocxFullWidthTitle("3- Qualificação do Avaliador"),
         new Paragraph({ text: introAvaliador || "-", spacing: { after: 160 } }),
         ReportService.buildDocxFullWidthTitle("4- Execução"),
@@ -1674,20 +2416,8 @@ export class ReportService {
                     qRef.testDescription ? String(qRef.testDescription) : "-"
                   ),
                   ReportService.buildLabelValueParagraph(
-                    "Referência (requisição)",
-                    qRef.requisicaoRef ? String(qRef.requisicaoRef) : "-"
-                  ),
-                  ReportService.buildLabelValueParagraph(
-                    "Referência (resposta)",
+                    "Resposta do Teste",
                     qRef.respostaTesteRef ? String(qRef.respostaTesteRef) : "-"
-                  ),
-                  ReportService.buildLabelValueParagraph(
-                    "Referência (amostra)",
-                    qRef.amostraRef ? String(qRef.amostraRef) : "-"
-                  ),
-                  ReportService.buildLabelValueParagraph(
-                    "Referência (evidências)",
-                    qRef.evidenciasRef ? String(qRef.evidenciasRef) : "-"
                   ),
                 ]
               : []),
@@ -1702,6 +2432,7 @@ export class ReportService {
               }, new Map<string, (typeof atts)[number]>())
               .values()
           );
+          // Todos os grupos de arquivos
           const attachmentGroups = [
             {
               label: "Requisição",
@@ -1800,7 +2531,52 @@ export class ReportService {
       );
       children.push(ReportService.buildConclusaoTableDocx(conclusaoRows));
 
+      // Resultado da Avaliação (admin builder DOCX) - renderizado apenas se mostrarMetodologia === 'MOSTRAR'
+      if (mostrarMetodologia === "MOSTRAR") {
+        const resultadoAvaliacao = ReportService.calcularResultadoAvaliacao(sections);
+        children.push(
+          new Paragraph({
+            text: "Resultado da Avaliação",
+            heading: HeadingLevel.HEADING_2,
+            spacing: { before: 240, after: 120 },
+          })
+        );
+        children.push(
+          new Paragraph({
+            children: [
+              new TextRun({ text: "Resultado: ", bold: true }),
+              new TextRun({ text: resultadoAvaliacao.resultado }),
+            ],
+            spacing: { after: 80 },
+          })
+        );
+        children.push(
+          new Paragraph({
+            text: resultadoAvaliacao.descricao,
+            spacing: { after: 200 },
+          })
+        );
+      } else {
+        children.push(new Paragraph({ text: "", spacing: { after: 200 } }));
+      }
+
+      const evidenceRows = ReportService.buildEvidenceAnnexRows(sections, "4", baseUrl);
+      children.push(ReportService.buildDocxFullWidthTitle("6- ANEXO EVIDÊNCIAS"));
+      children.push(
+        new Paragraph({
+          text:
+            "A tabela abaixo apresenta os itens avaliados e todos os arquivos enviados (norma e demais anexos) relacionados às questões.",
+          spacing: { after: 120 },
+        })
+      );
+      if (evidenceRows.length > 0) {
+        children.push(ReportService.buildEvidenceAnnexTableDocx(evidenceRows));
+      } else {
+        children.push(new Paragraph({ text: "-", spacing: { after: 120 } }));
+      }
+
       const doc = new Document({
+        styles: ReportService.buildDocxStyles(),
         sections: [
           {
             properties: {},
@@ -2558,7 +3334,144 @@ export class ReportService {
       });
     };
 
+    const drawEvidenceAnnexTable = (
+      rows: Array<{ itemLabel: string; files: Array<{ name: string; url: string }> }>
+    ) => {
+      const labelWidth = 220;
+      const filesWidth = contentWidth - labelWidth;
+      const paddingX = 6;
+      const paddingY = 6;
+      const fillHeader = "#F1F5F9";
+      const borderColor = "#94A3B8";
+
+      const drawRow = (
+        label: string,
+        files: Array<{ name: string; url: string }>,
+        isHeader: boolean
+      ) => {
+        const filesText = isHeader
+          ? (files[0]?.name || "")
+          : files.length
+            ? files.map((f) => `• ${f.name}`).join("\n")
+            : "-";
+        const rowHeight = Math.max(
+          measureTextHeight(label, {
+            width: labelWidth - paddingX * 2,
+            font: isHeader ? "Helvetica-Bold" : "Helvetica",
+            fontSize: 10,
+            lineGap: 1,
+          }),
+          measureTextHeight(filesText, {
+            width: filesWidth - paddingX * 2,
+            font: isHeader ? "Helvetica-Bold" : "Helvetica",
+            fontSize: 10,
+            lineGap: 2,
+          })
+        ) + paddingY * 2;
+
+        ensureSpace(rowHeight + 4);
+        const startY = pdf.y;
+
+        pdf.save();
+        pdf
+          .fillColor(isHeader ? fillHeader : "#FFFFFF")
+          .rect(marginLeft, startY, labelWidth, rowHeight)
+          .fill();
+        pdf
+          .fillColor(isHeader ? fillHeader : "#FFFFFF")
+          .rect(marginLeft + labelWidth, startY, filesWidth, rowHeight)
+          .fill();
+        pdf.restore();
+
+        pdf
+          .strokeColor(borderColor)
+          .rect(marginLeft, startY, contentWidth, rowHeight)
+          .stroke();
+        pdf
+          .strokeColor(borderColor)
+          .moveTo(marginLeft + labelWidth, startY)
+          .lineTo(marginLeft + labelWidth, startY + rowHeight)
+          .stroke();
+
+        pdf
+          .fillColor(textDark)
+          .font(isHeader ? "Helvetica-Bold" : "Helvetica")
+          .fontSize(10)
+          .text(label, marginLeft + paddingX, startY + paddingY, {
+            width: labelWidth - paddingX * 2,
+            lineGap: 1,
+          });
+        if (isHeader) {
+          pdf
+            .fillColor(textDark)
+            .font("Helvetica-Bold")
+            .fontSize(10)
+            .text(filesText, marginLeft + labelWidth + paddingX, startY + paddingY, {
+              width: filesWidth - paddingX * 2,
+              lineGap: 2,
+            });
+        } else if (files.length === 0) {
+          pdf
+            .fillColor(textDark)
+            .font("Helvetica")
+            .fontSize(10)
+            .text("-", marginLeft + labelWidth + paddingX, startY + paddingY, {
+              width: filesWidth - paddingX * 2,
+              lineGap: 2,
+            });
+        } else {
+          let cursorY = startY + paddingY;
+          files.forEach((file) => {
+            pdf
+              .fillColor(linkColor)
+              .font("Helvetica")
+              .fontSize(10)
+              .text(`• ${file.name}`, marginLeft + labelWidth + paddingX, cursorY, {
+                width: filesWidth - paddingX * 2,
+                lineGap: 2,
+                link: file.url || undefined,
+                underline: true,
+              });
+            cursorY = pdf.y;
+          });
+        }
+
+        pdf.y = startY + rowHeight;
+      };
+
+      drawRow("Item avaliado", [{ name: "Arquivos", url: "" }], true);
+      rows.forEach((row) => drawRow(row.itemLabel, row.files, false));
+    };
+
     drawConclusaoTable(conclusaoRows);
+
+    // Resultado da Avaliação (admin builder PDF) - renderizado apenas se mostrarMetodologia === 'MOSTRAR'
+    if (mostrarMetodologia === "MOSTRAR") {
+      const resultadoAvaliacao = ReportService.calcularResultadoAvaliacao(sections);
+      pdf.moveDown(0.6);
+      h3("Resultado da Avaliação");
+      pdf
+        .fillColor(textDark)
+        .font("Helvetica-Bold")
+        .fontSize(10)
+        .text("Resultado: ", marginLeft, pdf.y, { continued: true })
+        .font("Helvetica")
+        .text(resultadoAvaliacao.resultado, { lineGap: 2 });
+      pdf.moveDown(0.3);
+      p(resultadoAvaliacao.descricao);
+    }
+
+    const evidenceRows = ReportService.buildEvidenceAnnexRows(sections, "4", baseUrl);
+    pdf.moveDown(0.8);
+    titleBlock("6- ANEXO EVIDÊNCIAS");
+    p(
+      "A tabela abaixo apresenta os itens avaliados e todos os arquivos enviados (norma e demais anexos) relacionados às questões."
+    );
+    if (evidenceRows.length > 0) {
+      drawEvidenceAnnexTable(evidenceRows);
+    } else {
+      p("-");
+    }
 
     pdf.end();
     await new Promise<void>((resolve, reject) => {
@@ -2656,6 +3569,7 @@ export class ReportService {
       const filePath = path.join(reportsDir, filename);
 
       const doc = new Document({
+        styles: ReportService.buildDocxStyles(),
         sections: [
           {
             properties: {},

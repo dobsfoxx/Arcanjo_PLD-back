@@ -518,7 +518,7 @@ export class PldBuilderService {
 
   static async listConcludedForms(actor: BuilderActor) {
     this.ensureBuilderAccess(actor)
-    const where: any = { type: 'BUILDER_FORM' }
+    const where: any = { type: 'BUILDER_FORM', hiddenForAdmin: false }
     if (actor.role !== 'ADMIN') where.userId = actor.id
 
     const reports = await prismaAny.report.findMany({
@@ -582,6 +582,7 @@ export class PldBuilderService {
       where: { 
         type: 'BUILDER_FORM',
         assignedToEmail: normalizedEmail,
+        hiddenForUser: false,
         status: {
           in: ['SENT_TO_USER', 'IN_PROGRESS', 'COMPLETED']
         }
@@ -609,6 +610,29 @@ export class PldBuilderService {
     }))
   }
 
+  /**
+   * Usuário oculta um formulário da sua lista (não deleta permanentemente)
+   */
+  static async deleteUserForm(formId: string, userEmail: string) {
+    const normalizedEmail = userEmail.toLowerCase()
+    const report = await prismaAny.report.findUnique({ where: { id: formId } })
+    
+    if (!report || report.type !== 'BUILDER_FORM') {
+      throw new Error('Formulário não encontrado')
+    }
+
+    if (report.assignedToEmail !== normalizedEmail) {
+      throw new Error('Você não tem permissão para remover este formulário')
+    }
+
+    // Apenas oculta o formulário para o usuário, não deleta permanentemente
+    await prismaAny.report.update({ 
+      where: { id: formId },
+      data: { hiddenForUser: true }
+    })
+    return { success: true }
+  }
+
   static async deleteForm(formId: string, actor: BuilderActor) {
     this.ensureBuilderAccess(actor)
     const report = await prismaAny.report.findUnique({ where: { id: formId } })
@@ -620,7 +644,11 @@ export class PldBuilderService {
       throw new Error('Você não tem permissão para excluir este formulário')
     }
 
-    await prismaAny.report.delete({ where: { id: formId } })
+    // Apenas oculta o formulário para o admin, não deleta permanentemente
+    await prismaAny.report.update({ 
+      where: { id: formId },
+      data: { hiddenForAdmin: true }
+    })
     return { success: true }
   }
 
