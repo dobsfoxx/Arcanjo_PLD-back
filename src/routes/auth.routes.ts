@@ -63,10 +63,11 @@ function requireBootstrapToken(req: express.Request, res: express.Response): boo
 
 function setAuthCookie(res: express.Response, token: string) {
   const isProd = process.env.NODE_ENV === 'production'
+  const sameSite = isProd ? 'none' : 'lax'
   const maxAgeMs = Number.parseInt(process.env.JWT_COOKIE_MAX_AGE_MS || '', 10)
   res.cookie('pld_token', token, {
     httpOnly: true,
-    sameSite: 'lax',
+    sameSite,
     secure: isProd,
     path: '/',
     ...(Number.isFinite(maxAgeMs) && maxAgeMs > 0 ? { maxAge: maxAgeMs } : {}),
@@ -77,7 +78,7 @@ function clearAuthCookie(res: express.Response) {
   const isProd = process.env.NODE_ENV === 'production'
   res.clearCookie('pld_token', {
     httpOnly: true,
-    sameSite: 'lax',
+    sameSite: isProd ? 'none' : 'lax',
     secure: isProd,
     path: '/',
   })

@@ -38,10 +38,13 @@ app.use(
 app.disable('x-powered-by')
 
 // CORS - configure via CORS_ORIGIN (lista separada por vírgula). Ex: "https://app.com,http://localhost:5173"
-const corsAllowlist = (process.env.CORS_ORIGIN || '')
-  .split(',')
+const corsAllowlist = [process.env.CORS_ORIGIN, process.env.FRONTEND_URL]
+  .filter(Boolean)
+  .flatMap((value) => (value || '').split(','))
   .map((o) => o.trim())
   .filter(Boolean)
+const corsAllowlistSet = new Set(corsAllowlist)
+const corsAllowsAll = corsAllowlistSet.has('*')
 
 app.use(
   cors({
@@ -51,12 +54,16 @@ app.use(
       if (!origin) return cb(null, true)
 
       // Se não configurado, permitir apenas localhost em dev
-      if (corsAllowlist.length === 0) {
+      if (corsAllowlistSet.size === 0) {
         const isLocalhost = /^https?:\/\/localhost(:\d+)?$/.test(origin)
         return cb(null, process.env.NODE_ENV !== 'production' && isLocalhost)
       }
 
-      return cb(null, corsAllowlist.includes(origin))
+      if (corsAllowsAll) {
+        return cb(null, true)
+      }
+
+      return cb(null, corsAllowlistSet.has(origin))
     },
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'X-Bootstrap-Token'],
