@@ -207,8 +207,10 @@ router.get('/forgot-password/health', authenticate, requireAdmin, async (req, re
     }
 
     try {
-      await EmailService.verify()
-      smtpOk = true
+      smtpOk = !!(process.env.RESEND_API_KEY || '').trim()
+      if (!smtpOk) {
+        throw new Error('RESEND_API_KEY missing')
+      }
     } catch (error) {
       console.error('[AUTH] forgot-password health smtp error:', error)
     }
