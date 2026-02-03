@@ -219,7 +219,14 @@ export class AuthService {
       })
     } catch (error: unknown) {
       console.error('[AUTH] failed to send reset email:', error)
-      // Não propagar erro para evitar revelar detalhes de configuração SMTP.
+      try {
+        await (prisma as any).passwordResetToken.delete({ where: { token: rawToken } })
+      } catch (cleanupError) {
+        console.error('[AUTH] failed to cleanup reset token:', cleanupError)
+      }
+      const wrapped = new Error('Password reset email unavailable')
+      ;(wrapped as any).code = 'PASSWORD_RESET_EMAIL_UNAVAILABLE'
+      throw wrapped
     }
   }
 

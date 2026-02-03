@@ -186,6 +186,9 @@ router.post('/forgot-password', passwordLimiter, validateBody(forgotPasswordSche
     if (code === 'PASSWORD_RESET_STORE_UNAVAILABLE') {
       return res.status(503).json({ error: 'Recuperação de senha indisponível no momento. Tente novamente mais tarde.' })
     }
+    if (code === 'PASSWORD_RESET_EMAIL_UNAVAILABLE') {
+      return res.status(503).json({ error: 'Recuperação de senha indisponível no momento. Tente novamente mais tarde.' })
+    }
     res.status(500).json({ error: 'Erro ao solicitar recuperação de senha' })
   }
 })
