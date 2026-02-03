@@ -49,7 +49,7 @@ const corsAllowsAll = corsAllowlistSet.has('*')
 app.use(
   cors({
     credentials: true,
-    origin: (origin, cb) => {
+    origin: (origin: string | undefined, cb: (err: Error | null, allow?: boolean) => void) => {
       // Permitir requests sem Origin (curl, Postman, server-to-server)
       if (!origin) return cb(null, true)
 
