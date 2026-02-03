@@ -35,6 +35,11 @@ export class EmailService {
     return transporter
   }
 
+  static async verify() {
+    const transporter = await this.getTransporter()
+    return transporter.verify()
+  }
+
   static async sendMail(options: SendMailOptions) {
     const from = process.env.MAIL_FROM || options.to
 

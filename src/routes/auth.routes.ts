@@ -2,6 +2,7 @@ import express from 'express'
 import { OAuth2Client } from 'google-auth-library'
 import rateLimit from 'express-rate-limit'
 import { AuthService } from '../services/auth.service'
+import { EmailService } from '../services/email.service'
 import { authenticate, requireAdmin } from '../middleware/auth'
 import { validateBody } from '../middleware/validate'
 import {
@@ -180,7 +181,39 @@ router.post('/forgot-password', passwordLimiter, validateBody(forgotPasswordSche
     res.json({ message: 'Se existir uma conta com este e-mail, enviaremos instruções de recuperação.' })
   } catch (error: any) {
     console.error('[AUTH] forgot-password failed:', error)
+    const code = error?.code
+    if (code === 'PASSWORD_RESET_STORE_UNAVAILABLE') {
+      return res.status(503).json({ error: 'Recuperação de senha indisponível no momento. Tente novamente mais tarde.' })
+    }
     res.status(500).json({ error: 'Erro ao solicitar recuperação de senha' })
+  }
+})
+
+// Diagnóstico de recuperação de senha (DB + SMTP)
+router.get('/forgot-password/health', authenticate, requireAdmin, async (req, res) => {
+  try {
+    let dbOk = false
+    let smtpOk = false
+
+    try {
+      await (prisma as any).passwordResetToken.findFirst({ select: { id: true } })
+      dbOk = true
+    } catch (error) {
+      console.error('[AUTH] forgot-password health db error:', error)
+    }
+
+    try {
+      await EmailService.verify()
+      smtpOk = true
+    } catch (error) {
+      console.error('[AUTH] forgot-password health smtp error:', error)
+    }
+
+    const ok = dbOk && smtpOk
+    return res.status(ok ? 200 : 503).json({ ok, db: dbOk, smtp: smtpOk })
+  } catch (error) {
+    console.error('[AUTH] forgot-password health failed:', error)
+    return res.status(500).json({ ok: false, error: 'Erro ao verificar serviços de recuperação de senha' })
   }
 })
 

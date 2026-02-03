@@ -183,28 +183,44 @@ export class AuthService {
     const rawToken = crypto.randomBytes(32).toString('hex')
     const expiresAt = new Date(Date.now() + 60 * 60 * 1000) // 1 hora
 
-    await (prisma as any).passwordResetToken.create({
-      data: {
-        token: rawToken,
-        userId: user.id,
-        expiresAt,
-      },
-    })
+    try {
+      await (prisma as any).passwordResetToken.create({
+        data: {
+          token: rawToken,
+          userId: user.id,
+          expiresAt,
+        },
+      })
+    } catch (error: any) {
+      const code = error?.code || error?.meta?.code
+      console.error('[AUTH] failed to create reset token:', {
+        code,
+        message: error?.message || error,
+      })
+      const wrapped = new Error('Password reset token store unavailable')
+      ;(wrapped as any).code = 'PASSWORD_RESET_STORE_UNAVAILABLE'
+      throw wrapped
+    }
 
     const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5173'
     const resetLink = `${frontendUrl}/reset-password?token=${rawToken}`
 
-    await EmailService.sendMail({
-      to: user.email,
-      subject: 'Recuperação de senha - Sistema Arcanjo PLD',
-      html: `
-        <p>Olá, ${user.name}</p>
-        <p>Recebemos uma solicitação de redefinição de senha para sua conta.</p>
-        <p>Clique no link abaixo para criar uma nova senha (válido por 1 hora):</p>
-        <p><a href="${resetLink}">${resetLink}</a></p>
-        <p>Se você não solicitou esta alteração, ignore este e-mail.</p>
-      `,
-    })
+    try {
+      await EmailService.sendMail({
+        to: user.email,
+        subject: 'Recuperação de senha - Sistema Arcanjo PLD',
+        html: `
+          <p>Olá, ${user.name}</p>
+          <p>Recebemos uma solicitação de redefinição de senha para sua conta.</p>
+          <p>Clique no link abaixo para criar uma nova senha (válido por 1 hora):</p>
+          <p><a href="${resetLink}">${resetLink}</a></p>
+          <p>Se você não solicitou esta alteração, ignore este e-mail.</p>
+        `,
+      })
+    } catch (error: unknown) {
+      console.error('[AUTH] failed to send reset email:', error)
+      // Não propagar erro para evitar revelar detalhes de configuração SMTP.
+    }
   }
 
   // Redefinir senha a partir de um token válido
